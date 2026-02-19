@@ -1,5 +1,5 @@
 """
-GLiNER2 relation extraction  →  Cypher query generation.
+GLiNER2 relation extraction  →  Cypher query generation  →  optional Neo4j execution.
 
 Usage
 -----
@@ -16,7 +16,7 @@ Low-level converter (no ML model needed)::
     converter = RelationToCypherConverter()
     print(converter.convert(results, mode="merge"))
 
-End-to-end pipeline::
+End-to-end pipeline (Cypher generation only)::
 
     from cypher_validator import NLToCypher
 
@@ -24,12 +24,29 @@ End-to-end pipeline::
     cypher = pipeline(
         "John works for Apple Inc. and lives in San Francisco.",
         ["works_for", "lives_in"],
-        mode="merge",
+        mode="create",
+    )
+
+End-to-end pipeline with Neo4j execution::
+
+    from cypher_validator import NLToCypher, Neo4jDatabase
+
+    db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+    pipeline = NLToCypher.from_pretrained(
+        "fastino/gliner2-large-v1",
+        schema=schema,
+        db=db,
+    )
+    cypher, results = pipeline(
+        "John works for Apple Inc.",
+        ["works_for"],
+        mode="create",
+        execute=True,
     )
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +56,110 @@ from typing import Any, Dict, List, Optional, Tuple
 def _to_cypher_rel_type(rel_type: str) -> str:
     """Convert any-case relation type to UPPER_SNAKE_CASE (Cypher convention)."""
     return rel_type.upper()
+
+
+# ---------------------------------------------------------------------------
+# Neo4jDatabase
+# ---------------------------------------------------------------------------
+
+class Neo4jDatabase:
+    """Thin wrapper around the Neo4j Python driver for executing Cypher queries.
+
+    Requires the ``neo4j`` package::
+
+        pip install neo4j
+
+    Can be used as a context manager::
+
+        with Neo4jDatabase("bolt://localhost:7687", "neo4j", "password") as db:
+            results = db.execute("MATCH (n:Person) RETURN n LIMIT 5")
+
+    Or directly passed to :class:`NLToCypher` to enable database-aware execution::
+
+        db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+        pipeline = NLToCypher.from_pretrained("fastino/gliner2-large-v1", db=db)
+        cypher, results = pipeline(
+            "John works for Apple Inc.",
+            ["works_for"],
+            mode="create",
+            execute=True,
+        )
+
+    Parameters
+    ----------
+    uri:
+        Bolt or neo4j URI, e.g. ``"bolt://localhost:7687"`` or
+        ``"neo4j+s://xxx.databases.neo4j.io"``.
+    username:
+        Neo4j username (default: ``"neo4j"``).
+    password:
+        Neo4j password.
+    database:
+        Target database name (default: ``"neo4j"``).
+
+    Raises
+    ------
+    ImportError
+        If the ``neo4j`` package is not installed.
+    """
+
+    def __init__(
+        self,
+        uri: str,
+        username: str,
+        password: str,
+        database: str = "neo4j",
+    ) -> None:
+        try:
+            from neo4j import GraphDatabase  # type: ignore[import]
+        except ImportError as exc:
+            raise ImportError(
+                "The 'neo4j' package is required for database execution.\n"
+                "Install it with: pip install neo4j"
+            ) from exc
+
+        self._driver = GraphDatabase.driver(uri, auth=(username, password))
+        self._database = database
+
+    # ------------------------------------------------------------------
+
+    def execute(
+        self,
+        cypher: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Execute a Cypher query and return results as a list of record dicts.
+
+        Parameters
+        ----------
+        cypher:
+            Cypher query string to execute.
+        parameters:
+            Optional query parameters (e.g. ``{"name": "Alice"}`` for
+            ``WHERE n.name = $name``).
+
+        Returns
+        -------
+        list[dict]
+            One dict per returned record, keyed by the ``RETURN`` aliases.
+            Empty list when the query returns no rows (e.g. a bare ``CREATE``).
+        """
+        with self._driver.session(database=self._database) as session:
+            result = session.run(cypher, parameters or {})
+            return [dict(record) for record in result]
+
+    def close(self) -> None:
+        """Close the underlying driver and release all connections."""
+        self._driver.close()
+
+    def __enter__(self) -> "Neo4jDatabase":
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return f"Neo4jDatabase(database={self._database!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +451,6 @@ class GLiNER2RelationExtractor:
     Requires the ``gliner2`` Python package::
 
         pip install gliner2
-        # or: pip install "cypher_validator[gliner2]"
 
     Example
     -------
@@ -397,8 +517,7 @@ class GLiNER2RelationExtractor:
         except ImportError as exc:
             raise ImportError(
                 "The 'gliner2' package is required for relation extraction.\n"
-                "Install it with:  pip install gliner2\n"
-                "Or:               pip install 'cypher_validator[gliner2]'"
+                "Install it with:  pip install gliner2"
             ) from exc
 
         model = GLiNER2.from_pretrained(model_name)
@@ -465,10 +584,12 @@ class NLToCypher:
     """End-to-end pipeline: **natural language text → Cypher query**.
 
     Chains :class:`GLiNER2RelationExtractor` and :class:`RelationToCypherConverter`
-    into a single callable object.
+    into a single callable object.  Optionally executes the generated query
+    directly against a Neo4j database when a :class:`Neo4jDatabase` instance
+    is provided.
 
-    Example
-    -------
+    Example — generation only
+    -------------------------
     ::
 
         from cypher_validator import Schema, NLToCypher
@@ -481,21 +602,34 @@ class NLToCypher:
             "fastino/gliner2-large-v1",
             schema=schema,
         )
-
-        # Single call
         cypher = pipeline(
             "John works for Apple Inc.",
             ["works_for"],
-            mode="merge",
+            mode="create",
         )
-        # MERGE (a0:Person {name: "John"})-[:WORKS_FOR]->(b0:Company {name: "Apple Inc."})
+        # CREATE (a0:Person {name: "John"})-[:WORKS_FOR]->(b0:Company {name: "Apple Inc."})
         # RETURN a0, b0
 
-        # With both extraction result and Cypher
-        relations, cypher = pipeline.extract_and_convert(
+    Example — generation + execution (db-aware mode)
+    -------------------------------------------------
+    ::
+
+        from cypher_validator import NLToCypher, Neo4jDatabase
+
+        db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+        pipeline = NLToCypher.from_pretrained(
+            "fastino/gliner2-large-v1",
+            schema=schema,
+            db=db,
+        )
+        cypher, results = pipeline(
             "John works for Apple Inc.",
             ["works_for"],
+            mode="create",
+            execute=True,           # ← db-aware flag
         )
+        # cypher  → 'CREATE (a0:Person {name: "John"})-[:WORKS_FOR]->...'
+        # results → [{"a0": {...}, "b0": {...}}]  (Neo4j records)
     """
 
     def __init__(
@@ -503,6 +637,7 @@ class NLToCypher:
         extractor: GLiNER2RelationExtractor,
         schema: Any = None,
         name_property: str = "name",
+        db: Optional[Neo4jDatabase] = None,
     ) -> None:
         """
         Parameters
@@ -513,11 +648,16 @@ class NLToCypher:
             Optional ``cypher_validator.Schema`` for label-aware Cypher generation.
         name_property:
             Node property key for entity names (default: ``"name"``).
+        db:
+            Optional :class:`Neo4jDatabase` connection.  Required when
+            ``execute=True`` is passed to :meth:`__call__` or
+            :meth:`extract_and_convert`.
         """
         self.extractor = extractor
         self.converter = RelationToCypherConverter(
             schema=schema, name_property=name_property
         )
+        self.db = db
 
     # ------------------------------------------------------------------
 
@@ -528,6 +668,7 @@ class NLToCypher:
         schema: Any = None,
         threshold: float = 0.5,
         name_property: str = "name",
+        db: Optional[Neo4jDatabase] = None,
     ) -> "NLToCypher":
         """Create a pipeline by loading a pretrained GLiNER2 model.
 
@@ -542,15 +683,23 @@ class NLToCypher:
             Confidence threshold for the relation extractor.
         name_property:
             Node property key for entity names.
+        db:
+            Optional :class:`Neo4jDatabase` for direct query execution.
+            Pass this to enable ``execute=True`` on :meth:`__call__`.
 
         Returns
         -------
         NLToCypher
+
+        Raises
+        ------
+        ImportError
+            If the ``gliner2`` package is not installed.
         """
         extractor = GLiNER2RelationExtractor.from_pretrained(
             model_name, threshold=threshold
         )
-        return cls(extractor, schema=schema, name_property=name_property)
+        return cls(extractor, schema=schema, name_property=name_property, db=db)
 
     # ------------------------------------------------------------------
 
@@ -560,8 +709,9 @@ class NLToCypher:
         relation_types: List[str],
         mode: str = "match",
         threshold: Optional[float] = None,
+        execute: bool = False,
         **kwargs: Any,
-    ) -> str:
+    ) -> Union[str, Tuple[str, List[Dict[str, Any]]]]:
         """Extract relations from *text* and return a Cypher query.
 
         Parameters
@@ -574,6 +724,11 @@ class NLToCypher:
             Cypher generation mode: ``"match"``, ``"merge"``, or ``"create"``.
         threshold:
             Override the extractor's confidence threshold for this call.
+        execute:
+            When ``True``, execute the generated query against the
+            :class:`Neo4jDatabase` supplied at construction and return
+            ``(cypher, results)`` instead of just ``cypher``.
+            Requires ``db`` to be set.
         **kwargs:
             Extra keyword arguments forwarded to the Cypher converter
             (e.g. ``return_clause="RETURN *"``).
@@ -581,12 +736,33 @@ class NLToCypher:
         Returns
         -------
         str
-            Cypher query string, or ``""`` when no relations were found.
+            Cypher query string when ``execute=False`` (default).
+        tuple[str, list[dict]]
+            ``(cypher, db_results)`` when ``execute=True``.
+
+        Raises
+        ------
+        RuntimeError
+            When ``execute=True`` but no ``db`` was provided.
         """
         relations = self.extractor.extract_relations(
             text, relation_types, threshold=threshold
         )
-        return self.converter.convert(relations, mode=mode, **kwargs)
+        cypher = self.converter.convert(relations, mode=mode, **kwargs)
+
+        if execute:
+            if self.db is None:
+                raise RuntimeError(
+                    "execute=True requires a database connection. "
+                    "Pass db=Neo4jDatabase(...) when constructing NLToCypher "
+                    "or via NLToCypher.from_pretrained(..., db=db)."
+                )
+            results = self.db.execute(cypher) if cypher else []
+            return cypher, results
+
+        return cypher
+
+    # ------------------------------------------------------------------
 
     def extract_and_convert(
         self,
@@ -594,23 +770,58 @@ class NLToCypher:
         relation_types: List[str],
         mode: str = "match",
         threshold: Optional[float] = None,
+        execute: bool = False,
         **kwargs: Any,
-    ) -> Tuple[Dict[str, Any], str]:
+    ) -> Union[Tuple[Dict[str, Any], str], Tuple[Dict[str, Any], str, List[Dict[str, Any]]]]:
         """Extract relations and return both the raw dict and the Cypher string.
+
+        Parameters
+        ----------
+        text:
+            Input sentence or passage.
+        relation_types:
+            Relation labels to extract.
+        mode:
+            Cypher generation mode.
+        threshold:
+            Override extractor confidence threshold.
+        execute:
+            When ``True``, also execute the query against the database.
+            Requires ``db`` to be set.
+        **kwargs:
+            Forwarded to the Cypher converter.
 
         Returns
         -------
-        tuple
-            ``(relations_dict, cypher_query)``
+        tuple[dict, str]
+            ``(relations_dict, cypher_query)`` when ``execute=False``.
+        tuple[dict, str, list[dict]]
+            ``(relations_dict, cypher_query, db_results)`` when ``execute=True``.
+
+        Raises
+        ------
+        RuntimeError
+            When ``execute=True`` but no ``db`` was provided.
         """
         relations = self.extractor.extract_relations(
             text, relation_types, threshold=threshold
         )
         cypher = self.converter.convert(relations, mode=mode, **kwargs)
+
+        if execute:
+            if self.db is None:
+                raise RuntimeError(
+                    "execute=True requires a database connection. "
+                    "Pass db=Neo4jDatabase(...) when constructing NLToCypher."
+                )
+            results = self.db.execute(cypher) if cypher else []
+            return relations, cypher, results
+
         return relations, cypher
 
     def __repr__(self) -> str:
         return (
             f"NLToCypher(extractor={self.extractor!r}, "
-            f"converter={self.converter!r})"
+            f"converter={self.converter!r}, "
+            f"db={self.db!r})"
         )

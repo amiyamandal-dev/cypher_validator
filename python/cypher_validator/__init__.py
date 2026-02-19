@@ -18,6 +18,7 @@ from cypher_validator.gliner2_integration import (  # noqa: F401
     GLiNER2RelationExtractor,
     RelationToCypherConverter,
     NLToCypher,
+    Neo4jDatabase,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "GLiNER2RelationExtractor",
     "RelationToCypherConverter",
     "NLToCypher",
+    "Neo4jDatabase",
 ]
