@@ -18,6 +18,80 @@ from cypher_validator._cypher_validator import (
 )
 
 # ---------------------------------------------------------------------------
+# Schema (extended stubs for new methods)
+# ---------------------------------------------------------------------------
+
+class Schema:
+    """Graph schema: node labels with their allowed property sets,
+    and relationship types with their (source label, target label, property set).
+    """
+
+    def __init__(
+        self,
+        nodes: Dict[str, List[str]],
+        relationships: Dict[str, Tuple[str, str, List[str]]],
+    ) -> None: ...
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "Schema":
+        """Create a Schema from a plain Python dict."""
+        ...
+
+    @staticmethod
+    def from_json(json_str: str) -> "Schema":
+        """Deserialise a Schema from a JSON string produced by ``to_json()``."""
+        ...
+
+    def node_labels(self) -> List[str]: ...
+    def rel_types(self) -> List[str]: ...
+    def has_node_label(self, label: str) -> bool: ...
+    def has_rel_type(self, rel_type: str) -> bool: ...
+    def node_properties(self, label: str) -> List[str]: ...
+    def rel_properties(self, rel_type: str) -> List[str]: ...
+    def rel_endpoints(self, rel_type: str) -> Optional[Tuple[str, str]]: ...
+    def to_dict(self) -> Dict[str, Any]: ...
+
+    def to_json(self) -> str:
+        """Serialise the schema to a JSON string (round-trips with ``from_json``)."""
+        ...
+
+    def merge(self, other: "Schema") -> "Schema":
+        """Return a new Schema that is the union of *self* and *other*.
+
+        Property sets for shared labels/types are merged (union).
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+
+
+# ---------------------------------------------------------------------------
+# CypherGenerator (extended stubs)
+# ---------------------------------------------------------------------------
+
+class CypherGenerator:
+    """Generates random but schema-valid Cypher queries."""
+
+    def __init__(self, schema: Schema, seed: Optional[int] = None) -> None: ...
+
+    def generate(self, query_type: str) -> str:
+        """Generate a single random Cypher query of the given type."""
+        ...
+
+    def generate_batch(self, query_type: str, n: int) -> List[str]:
+        """Generate *n* queries of the given type in a single call.
+
+        Equivalent to calling :meth:`generate` *n* times but avoids per-call
+        Python overhead.
+        """
+        ...
+
+    @staticmethod
+    def supported_types() -> List[str]: ...
+    def __repr__(self) -> str: ...
+
+
+# ---------------------------------------------------------------------------
 # Neo4jDatabase
 # ---------------------------------------------------------------------------
 
@@ -84,6 +158,27 @@ class Neo4jDatabase:
         list[dict]
             One dict per returned record.  Empty list for queries with no
             ``RETURN`` clause (e.g. a bare ``CREATE``).
+        """
+        ...
+
+    def execute_many(
+        self,
+        queries: List[str],
+        parameters_list: Optional[List[Optional[Dict[str, Any]]]] = None,
+    ) -> List[List[Dict[str, Any]]]:
+        """Execute multiple Cypher queries in sequence and return all results.
+
+        Parameters
+        ----------
+        queries:
+            List of Cypher query strings to execute.
+        parameters_list:
+            Optional list of parameter dicts, one per query.
+
+        Returns
+        -------
+        list[list[dict]]
+            One inner list per query.
         """
         ...
 
@@ -257,6 +352,13 @@ class NLToCypher:
             mode="create",
             execute=True,
         )
+
+    Example — credentials from environment variables::
+
+        # export NEO4J_URI=bolt://localhost:7687
+        # export NEO4J_PASSWORD=secret
+        pipeline = NLToCypher.from_env("fastino/gliner2-large-v1", schema=schema)
+        cypher, results = pipeline("...", ["works_for"], mode="create", execute=True)
     """
 
     extractor: GLiNER2RelationExtractor
@@ -286,6 +388,29 @@ class NLToCypher:
         ------
         ImportError
             If the ``gliner2`` package is not installed.
+        """
+        ...
+
+    @classmethod
+    def from_env(
+        cls,
+        model_name: str = ...,
+        schema: Optional[Any] = None,
+        threshold: float = 0.5,
+        name_property: str = "name",
+        database: str = "neo4j",
+    ) -> "NLToCypher":
+        """Create a pipeline reading Neo4j credentials from environment variables.
+
+        Reads ``NEO4J_URI``, ``NEO4J_USERNAME`` (default ``"neo4j"``), and
+        ``NEO4J_PASSWORD`` from the process environment.
+
+        Raises
+        ------
+        KeyError
+            If ``NEO4J_URI`` or ``NEO4J_PASSWORD`` are not set.
+        ImportError
+            If the ``gliner2`` or ``neo4j`` packages are not installed.
         """
         ...
 

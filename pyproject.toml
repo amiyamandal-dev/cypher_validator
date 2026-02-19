@@ -5,13 +5,28 @@ build-backend = "maturin"
 [project]
 name = "cypher_validator"
 requires-python = ">=3.8"
+description = "Rust-accelerated Cypher query validator, generator, and NL-to-Cypher pipeline via GLiNER2"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Amiya Mandal", email = "amiyamandal-dev@users.noreply.github.com" },
+]
+keywords = ["cypher", "neo4j", "graph", "nlp", "validation"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: MIT License",
 ]
 dynamic = ["version"]
 dependencies = ["gliner2"]
+
+[project.urls]
+Homepage = "https://github.com/amiyamandal-dev/cypher_validator"
+Repository = "https://github.com/amiyamandal-dev/cypher_validator"
+Issues = "https://github.com/amiyamandal-dev/cypher_validator/issues"
 
 [project.optional-dependencies]
 neo4j = ["neo4j>=5.0"]

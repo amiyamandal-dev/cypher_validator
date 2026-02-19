@@ -46,6 +46,7 @@ End-to-end pipeline with Neo4j execution::
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 
@@ -147,6 +148,34 @@ class Neo4jDatabase:
         with self._driver.session(database=self._database) as session:
             result = session.run(cypher, parameters or {})
             return [dict(record) for record in result]
+
+    def execute_many(
+        self,
+        queries: List[str],
+        parameters_list: Optional[List[Optional[Dict[str, Any]]]] = None,
+    ) -> List[List[Dict[str, Any]]]:
+        """Execute multiple Cypher queries in sequence and return all results.
+
+        Parameters
+        ----------
+        queries:
+            List of Cypher query strings to execute.
+        parameters_list:
+            Optional list of parameter dicts, one per query.  When *None*
+            (or shorter than *queries*), missing entries default to no
+            parameters.
+
+        Returns
+        -------
+        list[list[dict]]
+            One inner list per query, each containing the record dicts
+            returned by that query.
+        """
+        params = parameters_list or []
+        return [
+            self.execute(q, params[i] if i < len(params) else None)
+            for i, q in enumerate(queries)
+        ]
 
     def close(self) -> None:
         """Close the underlying driver and release all connections."""
@@ -660,6 +689,58 @@ class NLToCypher:
         self.db = db
 
     # ------------------------------------------------------------------
+
+    @classmethod
+    def from_env(
+        cls,
+        model_name: str = GLiNER2RelationExtractor.DEFAULT_MODEL,
+        schema: Any = None,
+        threshold: float = 0.5,
+        name_property: str = "name",
+        database: str = "neo4j",
+    ) -> "NLToCypher":
+        """Create a pipeline reading Neo4j credentials from environment variables.
+
+        Reads ``NEO4J_URI``, ``NEO4J_USERNAME`` (default ``"neo4j"``), and
+        ``NEO4J_PASSWORD`` from the process environment and creates a
+        :class:`Neo4jDatabase` connection automatically.
+
+        Parameters
+        ----------
+        model_name:
+            HuggingFace model name or local path.
+        schema:
+            Optional ``cypher_validator.Schema`` for label-aware queries.
+        threshold:
+            Confidence threshold for the relation extractor.
+        name_property:
+            Node property key for entity names.
+        database:
+            Neo4j database name (default: ``"neo4j"``).
+
+        Returns
+        -------
+        NLToCypher
+            Pipeline with a live Neo4j connection ready for ``execute=True``.
+
+        Raises
+        ------
+        KeyError
+            If ``NEO4J_URI`` or ``NEO4J_PASSWORD`` are not set.
+        ImportError
+            If the ``gliner2`` or ``neo4j`` packages are not installed.
+        """
+        uri = os.environ["NEO4J_URI"]
+        username = os.environ.get("NEO4J_USERNAME", "neo4j")
+        password = os.environ["NEO4J_PASSWORD"]
+        db = Neo4jDatabase(uri, username, password, database=database)
+        return cls.from_pretrained(
+            model_name,
+            schema=schema,
+            threshold=threshold,
+            name_property=name_property,
+            db=db,
+        )
 
     @classmethod
     def from_pretrained(

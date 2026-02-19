@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use crate::schema::Schema;
@@ -13,17 +13,17 @@ impl PySchema {
     #[new]
     #[pyo3(signature = (nodes, relationships))]
     pub fn new(nodes: &Bound<'_, PyDict>, relationships: &Bound<'_, PyDict>) -> PyResult<Self> {
-        let mut node_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut node_map: HashMap<String, HashSet<String>> = HashMap::new();
         for (k, v) in nodes.iter() {
             let label: String = k.extract()?;
             let props: Vec<String> = v.extract()
                 .map_err(|_| pyo3::exceptions::PyTypeError::new_err(
                     format!("Expected list[str] for node properties of label '{}'", label)
                 ))?;
-            node_map.insert(label, props);
+            node_map.insert(label, props.into_iter().collect());
         }
 
-        let mut rel_map: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
+        let mut rel_map: HashMap<String, (String, String, HashSet<String>)> = HashMap::new();
         for (k, v) in relationships.iter() {
             let rel_type: String = k.extract()?;
             let (src, tgt, props): (String, String, Vec<String>) = v.extract()
@@ -33,7 +33,7 @@ impl PySchema {
                         rel_type
                     )
                 ))?;
-            rel_map.insert(rel_type, (src, tgt, props));
+            rel_map.insert(rel_type, (src, tgt, props.into_iter().collect()));
         }
 
         Ok(PySchema { inner: Schema::new(node_map, rel_map) })
@@ -67,6 +67,21 @@ impl PySchema {
         Self::new(nodes, relationships)
     }
 
+    /// Deserialise a Schema from a JSON string produced by ``to_json()``.
+    ///
+    /// Example::
+    ///
+    ///     json_str = schema.to_json()
+    ///     schema2 = Schema.from_json(json_str)
+    #[staticmethod]
+    pub fn from_json(json_str: &str) -> PyResult<Self> {
+        let inner: Schema = serde_json::from_str(json_str)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(
+                format!("Invalid Schema JSON: {}", e)
+            ))?;
+        Ok(PySchema { inner })
+    }
+
     // ===== Label / type queries =====
 
     fn node_labels(&self) -> Vec<String> {
@@ -94,8 +109,7 @@ impl PySchema {
 
     /// Return the list of properties declared for a relationship type.
     fn rel_properties(&self, rel_type: &str) -> Vec<String> {
-        self.inner.relationships.get(rel_type)
-            .map_or(vec![], |(_, _, props)| props.iter().map(|s| s.to_string()).collect())
+        self.inner.rel_properties(rel_type).into_iter().map(|s| s.to_string()).collect()
     }
 
     /// Return `(src_label, tgt_label)` for a relationship type, or None if unknown.
@@ -110,26 +124,78 @@ impl PySchema {
         let d = PyDict::new(py);
 
         let nodes = PyDict::new(py);
-        for (label, props) in &self.inner.nodes {
-            let prop_list = PyList::new(py, props.iter().map(|s| s.as_str()))?;
+        for label in self.inner.node_labels() {
+            let props = self.inner.node_properties(label);
+            let prop_list = PyList::new(py, props.iter().copied())?;
             nodes.set_item(label, prop_list)?;
         }
         d.set_item("nodes", nodes)?;
 
         let rels = PyDict::new(py);
-        for (rel_type, (src, tgt, props)) in &self.inner.relationships {
-            let prop_list = PyList::new(py, props.iter().map(|s| s.as_str()))?;
-            // Build (src, tgt, [props]) tuple
-            let tup = pyo3::types::PyTuple::new(py, [
-                src.as_str().into_pyobject(py)?.into_any().unbind(),
-                tgt.as_str().into_pyobject(py)?.into_any().unbind(),
-                prop_list.into_any().unbind(),
-            ])?;
-            rels.set_item(rel_type, tup)?;
+        for rel_type in self.inner.rel_types() {
+            if let Some((src, tgt)) = self.inner.rel_src_tgt(rel_type) {
+                let props = self.inner.rel_properties(rel_type);
+                let prop_list = PyList::new(py, props.iter().copied())?;
+                let tup = pyo3::types::PyTuple::new(py, [
+                    src.into_pyobject(py)?.into_any().unbind(),
+                    tgt.into_pyobject(py)?.into_any().unbind(),
+                    prop_list.into_any().unbind(),
+                ])?;
+                rels.set_item(rel_type, tup)?;
+            }
         }
         d.set_item("relationships", rels)?;
 
         Ok(d)
+    }
+
+    /// Serialise the schema to a JSON string.
+    ///
+    /// The result can be stored, transmitted, and later restored via
+    /// ``Schema.from_json()``.
+    ///
+    /// Example::
+    ///
+    ///     json_str = schema.to_json()
+    ///     schema2 = Schema.from_json(json_str)
+    ///     assert schema2 == schema  # round-trip safe
+    fn to_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.inner)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(
+                format!("Schema serialisation failed: {}", e)
+            ))
+    }
+
+    /// Return a new Schema that is the union of *self* and *other*.
+    ///
+    /// * Node labels and relationship types from both schemas are combined.
+    /// * When a label/type exists in both, the property sets are merged
+    ///   (union), so no declared property is lost.
+    /// * The *other* schema's endpoint labels take precedence for
+    ///   relationship types that appear in both schemas.
+    ///
+    /// Example::
+    ///
+    ///     s1 = Schema({"Person": ["name"]}, {"KNOWS": ("Person", "Person", [])})
+    ///     s2 = Schema({"Movie": ["title"]}, {"ACTED_IN": ("Person", "Movie", ["role"])})
+    ///     merged = s1.merge(s2)
+    ///     # merged has Person, Movie, KNOWS, ACTED_IN
+    fn merge(&self, other: &PySchema) -> PySchema {
+        let mut nodes = self.inner.nodes.clone();
+        for (label, props) in &other.inner.nodes {
+            nodes.entry(label.clone())
+                .and_modify(|existing: &mut HashSet<String>| existing.extend(props.iter().cloned()))
+                .or_insert_with(|| props.clone());
+        }
+
+        let mut relationships = self.inner.relationships.clone();
+        for (rel_type, (src, tgt, props)) in &other.inner.relationships {
+            relationships.entry(rel_type.clone())
+                .and_modify(|(_, _, existing_props)| existing_props.extend(props.iter().cloned()))
+                .or_insert_with(|| (src.clone(), tgt.clone(), props.clone()));
+        }
+
+        PySchema { inner: Schema::new(nodes, relationships) }
     }
 
     fn __repr__(&self) -> String {
