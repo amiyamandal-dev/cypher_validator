@@ -1,0 +1,278 @@
+// ===== Whitespace and comments (silent) =====
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* ~ "\n"? | "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+
+// ===== Entry point =====
+cypher = { SOI ~ statement ~ ";"? ~ EOI }
+
+statement = { regular_query | standalone_call }
+
+// ===== Queries =====
+regular_query = { single_query ~ (union_clause)* }
+
+union_clause = { (^"UNION" ~ ^"ALL"? ) ~ single_query }
+
+single_query = { multi_part_query | single_part_query }
+
+single_part_query = {
+    reading_clause ~ (reading_clause)* ~ (updating_clause)* ~ return_clause?
+  | updating_clause ~ (updating_clause)* ~ return_clause?
+  | return_clause
+}
+
+multi_part_query = {
+    ((reading_clause)* ~ (updating_clause)* ~ with_clause)+ ~
+    (reading_clause)* ~ (updating_clause)* ~ return_clause?
+}
+
+// ===== Clauses =====
+reading_clause = { match_clause | unwind_clause | in_query_call }
+
+match_clause = {
+    ^"OPTIONAL"? ~ ^"MATCH" ~ pattern ~ where_clause?
+}
+
+unwind_clause = { ^"UNWIND" ~ expression ~ ^"AS" ~ variable }
+
+in_query_call = { ^"CALL" ~ explicit_procedure_invocation ~ (^"YIELD" ~ yield_items)? }
+
+standalone_call = { ^"CALL" ~ explicit_procedure_invocation ~ (^"YIELD" ~ yield_items)? }
+
+explicit_procedure_invocation = { procedure_name ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
+
+procedure_name = @{ identifier ~ ("." ~ identifier)* }
+
+yield_items = { yield_item ~ ("," ~ yield_item)* }
+
+yield_item = { (procedure_result_field ~ ^"AS")? ~ variable }
+
+procedure_result_field = @{ identifier }
+
+updating_clause = {
+    create_clause
+  | merge_clause
+  | set_clause
+  | remove_clause
+  | delete_clause
+}
+
+create_clause  = { ^"CREATE" ~ pattern }
+merge_clause   = { ^"MERGE" ~ pattern_part ~ (on_match_or_create)* }
+on_match_or_create = {
+    (^"ON" ~ ^"MATCH" ~ set_clause)
+  | (^"ON" ~ ^"CREATE" ~ set_clause)
+}
+
+set_clause    = { ^"SET" ~ set_item ~ ("," ~ set_item)* }
+set_item      = {
+    (property_expression ~ "=" ~ expression)
+  | (variable ~ "=" ~ expression)
+  | (variable ~ "+=" ~ expression)
+  | (variable ~ ":" ~ node_labels)
+}
+
+remove_clause  = { ^"REMOVE" ~ remove_item ~ ("," ~ remove_item)* }
+remove_item    = {
+    (variable ~ ":" ~ node_labels)
+  | property_expression
+}
+
+delete_clause  = { ^"DETACH"? ~ ^"DELETE" ~ expression ~ ("," ~ expression)* }
+
+with_clause    = { ^"WITH" ~ (^"DISTINCT")? ~ return_body ~ where_clause? }
+return_clause  = { ^"RETURN" ~ (^"DISTINCT")? ~ return_body }
+
+return_body    = { return_items ~ (order_clause)? ~ (skip_clause)? ~ (limit_clause)? }
+
+return_items   = {
+    "*"
+  | (return_item ~ ("," ~ return_item)*)
+}
+
+return_item    = { expression ~ (^"AS" ~ variable)? }
+
+order_clause   = { ^"ORDER" ~ ^"BY" ~ sort_item ~ ("," ~ sort_item)* }
+sort_item      = { expression ~ (^"ASCENDING" | ^"ASC" | ^"DESCENDING" | ^"DESC")? }
+
+skip_clause    = { ^"SKIP" ~ expression }
+limit_clause   = { ^"LIMIT" ~ expression }
+
+where_clause   = { ^"WHERE" ~ expression }
+
+// ===== Patterns =====
+pattern        = { pattern_part ~ ("," ~ pattern_part)* }
+pattern_part   = { (variable ~ "=")? ~ pattern_element }
+pattern_element = { node_pattern ~ (relationship_pattern ~ node_pattern)* }
+
+node_pattern   = { "(" ~ variable? ~ node_labels? ~ properties? ~ ")" }
+node_labels    = { (":" ~ label_name)+ }
+label_name     = @{ identifier }
+
+relationship_pattern = {
+    left_arrow? ~ "-" ~ "[" ~ variable? ~ rel_types? ~ range_literal? ~ properties? ~ "]" ~ "-" ~ right_arrow?
+  | left_arrow? ~ "--" ~ right_arrow?
+}
+
+left_arrow   = { "<" }
+right_arrow  = { ">" }
+rel_types    = { ":" ~ rel_type_name ~ ("|" ~ ":"? ~ rel_type_name)* }
+rel_type_name = @{ identifier }
+
+range_literal = { "*" ~ (integer_literal ~ (".." ~ integer_literal?)? )? }
+
+properties   = { map_literal | parameter }
+
+// ===== Expressions =====
+expression = { or_expr }
+
+// Word-boundary-guarded boolean keyword operators.
+// @{ } (atomic) prevents implicit whitespace from being consumed between
+// the keyword text and the negative lookahead, so "AND n.foo" correctly
+// matches: AND is consumed, then the space is NOT consumed before the
+// lookahead sees a non-alphanumeric character and succeeds.
+or_kw  = @{ ^"OR"  ~ !(ASCII_ALPHANUMERIC | "_") }
+xor_kw = @{ ^"XOR" ~ !(ASCII_ALPHANUMERIC | "_") }
+and_kw = @{ ^"AND" ~ !(ASCII_ALPHANUMERIC | "_") }
+not_kw = @{ ^"NOT" ~ !(ASCII_ALPHANUMERIC | "_") }
+
+or_expr  = { xor_expr  ~ (or_kw  ~ xor_expr)* }
+xor_expr = { and_expr  ~ (xor_kw ~ and_expr)* }
+and_expr = { not_expr  ~ (and_kw ~ not_expr)* }
+not_expr = { not_kw* ~ comparison_expr }
+
+comparison_expr = {
+    add_sub_expr ~ (comparison_op ~ add_sub_expr)*
+}
+
+comparison_op = {
+    "<=" | ">=" | "<>" | "<" | ">" | "=" | "=~"
+  | (^"IS" ~ ^"NOT" ~ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_"))
+  | (^"IS" ~ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_"))
+  | (^"IN" ~ !(ASCII_ALPHANUMERIC | "_"))
+  | (^"STARTS" ~ ^"WITH" ~ !(ASCII_ALPHANUMERIC | "_"))
+  | (^"ENDS" ~ ^"WITH" ~ !(ASCII_ALPHANUMERIC | "_"))
+  | (^"CONTAINS" ~ !(ASCII_ALPHANUMERIC | "_"))
+}
+
+add_sub_expr = { mul_div_expr ~ (("+"|"-") ~ mul_div_expr)* }
+mul_div_expr = { mod_expr ~ (("*"|"/") ~ mod_expr)* }
+mod_expr     = { power_expr ~ ("%" ~ power_expr)* }
+power_expr   = { unary_expr ~ ("^" ~ unary_expr)* }
+
+unary_expr   = { "-"? ~ postfix_expr }
+
+postfix_expr = { atom ~ postfix_op* }
+
+postfix_op   = {
+    property_lookup
+  | subscript_op
+  | list_slice_op
+}
+
+property_lookup = { "." ~ property_key_name }
+subscript_op    = { "[" ~ expression ~ "]" }
+list_slice_op   = { "[" ~ expression? ~ ".." ~ expression? ~ "]" }
+
+// ===== Atoms =====
+atom = {
+    literal
+  | parameter
+  | case_expression
+  | list_comprehension
+  | quantifier_expression
+  | exists_subquery
+  | count_star
+  | function_invocation
+  | variable
+  | parenthesized_expr
+}
+
+parenthesized_expr = { "(" ~ expression ~ ")" }
+
+count_star = { ^"COUNT" ~ "(" ~ "*" ~ ")" }
+
+function_invocation = {
+    function_name ~ "(" ~ (^"DISTINCT")? ~ (expression ~ ("," ~ expression)*)? ~ ")"
+}
+
+// Function names can be keywords (COUNT, COLLECT, EXISTS, etc.) or identifiers
+function_name = @{ namespace? ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+namespace     = @{ (identifier ~ ".")+ }
+
+case_expression = {
+    ^"CASE" ~ expression? ~
+    (^"WHEN" ~ expression ~ ^"THEN" ~ expression)+ ~
+    (^"ELSE" ~ expression)? ~
+    ^"END"
+}
+
+list_comprehension = {
+    "[" ~ filter_expression ~ ("|" ~ expression)? ~ "]"
+}
+
+filter_expression = {
+    id_in_coll ~ (^"WHERE" ~ expression)?
+}
+
+id_in_coll = { variable ~ ^"IN" ~ expression }
+
+quantifier_expression = {
+    (^"ALL" | ^"ANY" | ^"NONE" | ^"SINGLE") ~ "(" ~ filter_expression ~ ")"
+}
+
+exists_subquery = {
+    ^"EXISTS" ~ "{" ~ pattern ~ "}"
+}
+
+// ===== Literals =====
+literal = {
+    float_literal
+  | integer_literal
+  | string_literal
+  | boolean_literal
+  | null_literal
+  | list_literal
+  | map_literal
+}
+
+integer_literal = @{ ASCII_DIGIT+ | ("0x" ~ ASCII_HEX_DIGIT+) | ("0o" ~ ASCII_OCT_DIGIT+) }
+float_literal   = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT* ~ (("e"|"E") ~ ("+"|"-")? ~ ASCII_DIGIT+)? }
+string_literal  = @{ ("\"" ~ (!"\"" ~ ANY)* ~ "\"") | ("'" ~ (!"'" ~ ANY)* ~ "'") }
+boolean_literal = { ^"TRUE" | ^"FALSE" }
+null_literal    = { ^"NULL" }
+
+list_literal    = { "[" ~ (expression ~ ("," ~ expression)*)? ~ "]" }
+
+map_literal     = { "{" ~ (property_key_value_pair ~ ("," ~ property_key_value_pair)*)? ~ "}" }
+property_key_value_pair = { property_key_name ~ ":" ~ expression }
+
+property_key_name = @{ identifier }
+
+property_expression = { variable ~ (property_lookup)+ }
+
+// Parameters can use any word including reserved keywords (e.g. $limit, $order)
+parameter = @{ "$" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* | "$" ~ ASCII_DIGIT+ }
+
+// ===== Identifiers =====
+variable = @{ identifier }
+
+identifier = @{
+    !keyword ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")*
+  | backtick_identifier
+}
+
+backtick_identifier = @{ "`" ~ (!"`" ~ ANY)* ~ "`" }
+
+keyword = {
+    (^"ALL" | ^"AND" | ^"ANY" | ^"AS" | ^"ASC" | ^"ASCENDING"
+    | ^"BY" | ^"CALL" | ^"CASE" | ^"CONTAINS" | ^"COUNT"
+    | ^"CREATE" | ^"DELETE" | ^"DESC" | ^"DESCENDING" | ^"DETACH"
+    | ^"DISTINCT" | ^"DO" | ^"DROP" | ^"ELSE" | ^"END" | ^"ENDS"
+    | ^"EXISTS" | ^"FALSE" | ^"FOR" | ^"FROM" | ^"IN" | ^"IS"
+    | ^"LIMIT" | ^"MATCH" | ^"MERGE" | ^"NEW" | ^"NONE" | ^"NOT"
+    | ^"NULL" | ^"ON" | ^"OPTIONAL" | ^"OR" | ^"ORDER" | ^"REMOVE"
+    | ^"RETURN" | ^"SET" | ^"SINGLE" | ^"SKIP" | ^"STARTS" | ^"THEN"
+    | ^"TRUE" | ^"UNION" | ^"UNWIND" | ^"WHEN" | ^"WHERE" | ^"WITH"
+    | ^"XOR" | ^"YIELD") ~
+    !(ASCII_ALPHANUMERIC | "_")
+}
