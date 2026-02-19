@@ -115,12 +115,23 @@ for r in results:
 d = schema.to_dict()
 schema2 = Schema.from_dict(d)
 
-# 6. Generate random valid queries
+# … or as a JSON string
+json_str = schema.to_json()
+schema3  = Schema.from_json(json_str)
+
+# 6. Merge two schemas
+s_extra = Schema({"Director": ["name"]}, {"DIRECTED": ("Director", "Movie", [])})
+merged  = schema.merge(s_extra)   # union of labels, types, and properties
+
+# 7. Generate random valid queries
 gen = CypherGenerator(schema, seed=42)
 print(gen.generate("match_relationship"))
 # MATCH (a:Person)-[r:ACTED_IN]->(b:Movie) RETURN a, r, b
 
-# 7. Parse without a schema — also extracts property keys
+# Generate many queries at once (avoids per-call Python overhead)
+batch = gen.generate_batch("match_return", 100)
+
+# 8. Parse without a schema — also extracts property keys
 info = parse_query("MATCH (p:Person)-[:ACTED_IN]->(m:Movie) RETURN p.name, m.year")
 print(info.is_valid)        # True
 print(info.labels_used)     # ['Movie', 'Person']
@@ -186,7 +197,42 @@ with open("schema.json") as f:
 schema2 = Schema.from_dict(d)
 ```
 
-`Schema.from_dict()` is the preferred way to restore a schema from serialised form. It accepts any dict produced by `to_dict()`.
+**JSON serialization (`to_json` / `from_json`):**
+
+```python
+# Serialise to a compact JSON string
+json_str = schema.to_json()
+# '{"nodes":{"Person":["age","email","name"],...},...}'
+
+# Restore from the JSON string
+schema2 = Schema.from_json(json_str)
+
+# Store/load via a file
+with open("schema.json", "w") as f:
+    f.write(schema.to_json())
+
+with open("schema.json") as f:
+    schema3 = Schema.from_json(f.read())
+```
+
+**Merging schemas (`merge`):**
+
+```python
+s1 = Schema(
+    nodes={"Person": ["name", "age"]},
+    relationships={"KNOWS": ("Person", "Person", [])},
+)
+s2 = Schema(
+    nodes={"Movie": ["title"], "Person": ["email"]},   # Person gets extra property
+    relationships={"ACTED_IN": ("Person", "Movie", ["role"])},
+)
+merged = s1.merge(s2)
+merged.node_labels()               # ["Movie", "Person"]
+merged.node_properties("Person")   # ["age", "email", "name"]  ← union
+merged.rel_types()                 # ["ACTED_IN", "KNOWS"]
+```
+
+`Schema.from_dict()` is the preferred way to restore a schema from a plain dict produced by `to_dict()`.
 
 ---
 
@@ -316,6 +362,9 @@ CypherGenerator.supported_types()
 # ['match_return', 'match_where_return', 'create', 'merge', 'aggregation',
 #  'match_relationship', 'create_relationship', 'match_set', 'match_delete',
 #  'with_chain', 'distinct_return', 'order_by', 'unwind']
+
+# Generate many queries in one call (avoids per-call Python overhead)
+queries = gen.generate_batch("match_return", 500)  # list[str], len == 500
 ```
 
 **Supported query types (13 total):**
@@ -609,7 +658,48 @@ cypher = pipeline(
 )
 ```
 
-**`from_pretrained()` parameters:**
+**Database-aware execution (`execute=True`):**
+
+Pass a `Neo4jDatabase` to execute the generated query directly and receive both the Cypher string and the Neo4j records:
+
+```python
+from cypher_validator import NLToCypher, Neo4jDatabase
+
+db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+pipeline = NLToCypher.from_pretrained("fastino/gliner2-large-v1", schema=schema, db=db)
+
+# execute=True → returns (cypher, records) instead of just cypher
+cypher, records = pipeline(
+    "John works for Apple Inc.",
+    ["works_for"],
+    mode="create",
+    execute=True,
+)
+# cypher  → 'CREATE (a0:Person {name: "John"})-[:WORKS_FOR]->(b0:Company {name: "Apple Inc."})\nRETURN a0, b0'
+# records → [{"a0": {...}, "b0": {...}}]  (Neo4j driver records as dicts)
+```
+
+**Credentials from environment variables (`from_env`):**
+
+```bash
+export NEO4J_URI=bolt://localhost:7687
+export NEO4J_USERNAME=neo4j        # optional, defaults to "neo4j"
+export NEO4J_PASSWORD=secret
+```
+
+```python
+# Reads NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD automatically
+pipeline = NLToCypher.from_env("fastino/gliner2-large-v1", schema=schema)
+
+cypher, records = pipeline(
+    "John works for Apple Inc.",
+    ["works_for"],
+    mode="create",
+    execute=True,
+)
+```
+
+**`from_pretrained()` / `from_env()` parameters:**
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -617,6 +707,8 @@ cypher = pipeline(
 | `schema` | `None` | Optional schema for label-aware Cypher |
 | `threshold` | `0.5` | Confidence threshold for relation extraction |
 | `name_property` | `"name"` | Node property key for entity text |
+| `db` | `None` | `Neo4jDatabase` connection (`from_pretrained` only) |
+| `database` | `"neo4j"` | Neo4j database name (`from_env` only) |
 
 **`__call__()` / `extract_and_convert()` parameters:**
 
@@ -626,7 +718,52 @@ cypher = pipeline(
 | `relation_types` | required | Relation labels to extract |
 | `mode` | `"match"` | Cypher generation mode (`"match"`, `"merge"`, `"create"`) |
 | `threshold` | `None` | Override instance threshold |
+| `execute` | `False` | When `True`, run the query against the DB and return `(cypher, records)` |
 | `return_clause` | auto | Custom `RETURN …` tail |
+
+---
+
+### Neo4jDatabase
+
+Thin wrapper around the official [Neo4j Python driver](https://neo4j.com/docs/python-manual/current/) for executing Cypher queries. Requires `pip install "cypher_validator[neo4j]"`.
+
+```python
+from cypher_validator import Neo4jDatabase
+
+# Direct instantiation
+db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password", database="neo4j")
+
+# Context manager — driver is closed on exit
+with Neo4jDatabase("bolt://localhost:7687", "neo4j", "password") as db:
+    results = db.execute("MATCH (n:Person) RETURN n.name LIMIT 5")
+    # [{"n.name": "Alice"}, {"n.name": "Bob"}, ...]
+
+# With parameters
+results = db.execute(
+    "MATCH (n:Person {name: $name}) RETURN n",
+    {"name": "Alice"},
+)
+
+# Run multiple queries in one call
+queries = [
+    "MATCH (n:Person) RETURN count(n)",
+    "MATCH (n:Movie) RETURN count(n)",
+]
+all_results = db.execute_many(queries)
+# [[{"count(n)": 42}], [{"count(n)": 17}]]
+
+# With per-query parameters
+all_results = db.execute_many(
+    ["MATCH (n {name: $x}) RETURN n", "MATCH (n {name: $x}) RETURN n"],
+    [{"x": "Alice"}, {"x": "Bob"}],
+)
+```
+
+| Method | Description |
+|---|---|
+| `execute(cypher, parameters=None)` | Run one query, return `list[dict]` |
+| `execute_many(queries, parameters_list=None)` | Run multiple queries, return `list[list[dict]]` |
+| `close()` | Release driver connections |
 
 ---
 
@@ -742,9 +879,13 @@ print(f"Validated {len(results)} queries in {elapsed:.3f}s")
 
 This keeps suggestion lookup fast even when the schema has many labels.
 
+### O(1) property lookup
+
+Node and relationship property sets are stored as Rust `HashSet<String>` internally, so `node_has_property` and `rel_has_property` are O(1) regardless of how many properties a label declares.
+
 ### Construction-time caching
 
-`CypherGenerator` and `SemanticValidator` precompute their working data sets (label lists, relationship-type lists, per-label property maps) once at construction. Repeated calls to `generate()` and `validate()` avoid redundant allocations.
+`CypherGenerator` and `SemanticValidator` precompute their working data sets (label lists, relationship-type lists, per-label property maps) once at construction. Repeated calls to `generate()` / `generate_batch()` and `validate()` avoid redundant allocations.
 
 ---
 
@@ -841,7 +982,7 @@ maturin build --release
 ### Running tests
 
 ```bash
-# All 261 tests
+# All 283 tests
 pytest tests/
 
 # Specific test modules
