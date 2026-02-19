@@ -235,6 +235,10 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          # The publish job never checks out the repo, so there are no
+          # dependency files to key the cache on. Disable caching entirely.
+          enable-cache: false
 
       - name: Publish to PyPI
         # Publish on a real tag push, or a manual dispatch where dry_run is false.
