@@ -198,6 +198,142 @@ impl PySchema {
         PySchema { inner: Schema::new(nodes, relationships) }
     }
 
+    // ===== LLM prompt helpers =====
+
+    /// Return a human-readable, LLM-friendly representation of the schema.
+    ///
+    /// Suitable for injecting into an LLM system prompt to tell the model which
+    /// labels, relationship types, and properties exist in the graph.
+    ///
+    /// Example::
+    ///
+    ///     print(schema.to_prompt())
+    ///     # Graph Schema
+    ///     # ============
+    ///     #
+    ///     # Nodes
+    ///     # -----
+    ///     #   :Person                   name, age, email
+    ///     #   :Company                  name, founded
+    ///     #
+    ///     # Relationships
+    ///     # -------------
+    ///     #   :WORKS_FOR                (Person)-->(Company)   since, role
+    ///     #   :LIVES_IN                 (Person)-->(City)
+    fn to_prompt(&self) -> String {
+        let mut out = String::from("Graph Schema\n============\n\nNodes\n-----\n");
+        for label in self.inner.node_labels() {
+            let props = self.inner.node_properties(label);
+            if props.is_empty() {
+                out.push_str(&format!("  :{}\n", label));
+            } else {
+                out.push_str(&format!("  :{:<26}  {}\n", label, props.join(", ")));
+            }
+        }
+        out.push_str("\nRelationships\n-------------\n");
+        for rel_type in self.inner.rel_types() {
+            let props = self.inner.rel_properties(rel_type);
+            if let Some((src, tgt)) = self.inner.rel_src_tgt(rel_type) {
+                let endpoints = format!("({})-->({})", src, tgt);
+                if props.is_empty() {
+                    out.push_str(&format!("  :{:<26}  {}\n", rel_type, endpoints));
+                } else {
+                    out.push_str(&format!(
+                        "  :{:<26}  {}   {}\n",
+                        rel_type,
+                        endpoints,
+                        props.join(", ")
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Return the schema formatted as a Markdown table.
+    ///
+    /// Useful for LLM contexts that render Markdown, documentation, or
+    /// README sections.
+    ///
+    /// Example::
+    ///
+    ///     print(schema.to_markdown())
+    ///     # ### Nodes
+    ///     # | Label | Properties |
+    ///     # |---|---|
+    ///     # | :Person | name, age, email |
+    ///     # ...
+    fn to_markdown(&self) -> String {
+        let mut out = String::from("### Nodes\n\n| Label | Properties |\n|---|---|\n");
+        for label in self.inner.node_labels() {
+            let props = self.inner.node_properties(label);
+            let props_str = if props.is_empty() {
+                "\u{2014}".to_string() // em-dash
+            } else {
+                props.join(", ")
+            };
+            out.push_str(&format!("| :{} | {} |\n", label, props_str));
+        }
+        out.push_str("\n### Relationships\n\n| Type | Source \u{2192} Target | Properties |\n|---|---|---|\n");
+        for rel_type in self.inner.rel_types() {
+            if let Some((src, tgt)) = self.inner.rel_src_tgt(rel_type) {
+                let props = self.inner.rel_properties(rel_type);
+                let props_str = if props.is_empty() {
+                    "\u{2014}".to_string()
+                } else {
+                    props.join(", ")
+                };
+                out.push_str(&format!(
+                    "| :{} | :{} \u{2192} :{} | {} |\n",
+                    rel_type, src, tgt, props_str
+                ));
+            }
+        }
+        out
+    }
+
+    /// Return the schema as inline Cypher patterns.
+    ///
+    /// This format is often the most natural for LLMs that already know Cypher,
+    /// since it mirrors the query syntax they will generate.
+    ///
+    /// Example::
+    ///
+    ///     print(schema.to_cypher_context())
+    ///     # // Node labels and their properties
+    ///     # (:Person {name, age, email})
+    ///     # (:Company {name, founded})
+    ///     #
+    ///     # // Relationship types
+    ///     # (:Person)-[:WORKS_FOR {since, role}]->(:Company)
+    ///     # (:Person)-[:LIVES_IN]->(:City)
+    fn to_cypher_context(&self) -> String {
+        let mut out = String::from("// Node labels and their properties\n");
+        for label in self.inner.node_labels() {
+            let props = self.inner.node_properties(label);
+            if props.is_empty() {
+                out.push_str(&format!("(:{label})\n"));
+            } else {
+                out.push_str(&format!("(:{label} {{{}}})\n", props.join(", ")));
+            }
+        }
+        out.push_str("\n// Relationship types\n");
+        for rel_type in self.inner.rel_types() {
+            if let Some((src, tgt)) = self.inner.rel_src_tgt(rel_type) {
+                let props = self.inner.rel_properties(rel_type);
+                if props.is_empty() {
+                    out.push_str(&format!("(:{src})-[:{rel_type}]->(:{tgt})\n"));
+                } else {
+                    out.push_str(&format!(
+                        "(:{src})-[:{rel_type} {{{}}}]->(:{tgt})\n",
+                        props.join(", ")
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Schema(nodes={:?}, relationships={:?})",

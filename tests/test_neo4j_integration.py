@@ -127,8 +127,7 @@ class TestNLToCypherWithoutExecute:
         result = pipeline("John works for Apple.", ["works_for"], mode="create")
         assert isinstance(result, str)
         assert "CREATE" in result
-        assert "John" in result
-        assert "Apple" in result
+        assert ":WORKS_FOR" in result
 
     def test_call_explicit_execute_false(self):
         """execute=False explicitly still returns str."""
@@ -193,7 +192,8 @@ class TestNLToCypherWithExecute:
         pipeline = NLToCypher(extractor, db=db)
 
         cypher, _ = pipeline("text", ["lives_in"], mode="create", execute=True)
-        db.execute.assert_called_once_with(cypher)
+        db.execute.assert_called_once()
+        assert db.execute.call_args[0][0] == cypher
 
     def test_execute_true_no_db_raises(self):
         """RuntimeError when execute=True but db is None."""
@@ -305,10 +305,14 @@ class TestRealisticScenarios:
             execute=True,
         )
 
-        assert 'CREATE (a0:Person {name: "John"})-[:WORKS_FOR]->(b0:Company {name: "Apple Inc."})' in cypher
-        assert 'CREATE (a1:Person {name: "John"})-[:LIVES_IN]->(b1:City {name: "San Francisco"})' in cypher
+        assert 'CREATE (a0:Person {name: $a0_val})-[:WORKS_FOR]->(b0:Company {name: $b0_val})' in cypher
+        assert 'CREATE (a1:Person {name: $a1_val})-[:LIVES_IN]->(b1:City {name: $b1_val})' in cypher
         assert "RETURN a0, b0, a1, b1" in cypher
-        db.execute.assert_called_once_with(cypher)
+        db.execute.assert_called_once()
+        call_args = db.execute.call_args[0]
+        assert call_args[0] == cypher
+        assert call_args[1]["a0_val"] == "John"
+        assert call_args[1]["b0_val"] == "Apple Inc."
 
     def test_bob_acquired_techcorp_no_schema(self):
         """No schema → no labels, but query is still generated and executed."""
@@ -325,7 +329,7 @@ class TestRealisticScenarios:
             execute=True,
         )
 
-        assert 'CREATE (a0 {name: "Bob"})-[:ACQUIRED]->(b0 {name: "TechCorp"})' in cypher
+        assert 'CREATE (a0 {name: $a0_val})-[:ACQUIRED]->(b0 {name: $b0_val})' in cypher
         assert "RETURN a0, b0" in cypher
 
     def test_merge_mode_upserts(self):

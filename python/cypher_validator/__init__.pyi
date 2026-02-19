@@ -62,6 +62,30 @@ class Schema:
         """
         ...
 
+    def to_prompt(self) -> str:
+        """Return a human-readable, LLM-friendly text representation of the schema.
+
+        Suitable for injecting into an LLM system prompt so the model knows
+        which labels, relationship types, and properties are available.
+        """
+        ...
+
+    def to_markdown(self) -> str:
+        """Return the schema formatted as a Markdown table.
+
+        Useful for documentation, README sections, and LLM contexts that
+        render Markdown.
+        """
+        ...
+
+    def to_cypher_context(self) -> str:
+        """Return the schema as inline Cypher node/relationship patterns.
+
+        This mirrors Cypher query syntax (``(:Label {prop})-[:REL]->()``)
+        which is the most natural format for LLMs that already know Cypher.
+        """
+        ...
+
     def __repr__(self) -> str: ...
 
 
@@ -196,12 +220,17 @@ class Neo4jDatabase:
 # ---------------------------------------------------------------------------
 
 class RelationToCypherConverter:
-    """Convert GLiNER2 relation-extraction output to a Cypher query.
+    """Convert GLiNER2 relation-extraction output to a parameterized Cypher query.
+
+    All methods return ``(cypher_string, parameters_dict)`` so that entity
+    values are never interpolated into the query string (prevents Cypher
+    injection).  Pass both to :meth:`Neo4jDatabase.execute`.
 
     Example::
 
         converter = RelationToCypherConverter(schema=schema)
-        cypher = converter.convert(results, mode="merge")
+        cypher, params = converter.convert(results, mode="merge")
+        db.execute(cypher, params)
     """
 
     schema: Any
@@ -217,10 +246,10 @@ class RelationToCypherConverter:
         self,
         relations: Dict[str, Any],
         return_clause: Optional[str] = None,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         """Build MATCH clauses for the extracted relations.
 
-        Returns an empty string when nothing was extracted.
+        Returns ``("", {})`` when nothing was extracted.
         """
         ...
 
@@ -228,11 +257,11 @@ class RelationToCypherConverter:
         self,
         relations: Dict[str, Any],
         return_clause: Optional[str] = None,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         """Build MERGE clauses to upsert extracted entities/relationships.
 
         Node labels are added automatically when a schema is provided.
-        Returns an empty string when nothing was extracted.
+        Returns ``("", {})`` when nothing was extracted.
         """
         ...
 
@@ -240,10 +269,10 @@ class RelationToCypherConverter:
         self,
         relations: Dict[str, Any],
         return_clause: Optional[str] = None,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         """Build CREATE clauses to insert extracted entities/relationships.
 
-        Returns an empty string when nothing was extracted.
+        Returns ``("", {})`` when nothing was extracted.
         """
         ...
 
@@ -252,8 +281,8 @@ class RelationToCypherConverter:
         relations: Dict[str, Any],
         mode: str = "match",
         **kwargs: Any,
-    ) -> str:
-        """Convert extracted relations to a Cypher query.
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Convert extracted relations to a parameterized Cypher query.
 
         Raises
         ------
@@ -531,6 +560,201 @@ class NLToCypher:
     def __repr__(self) -> str: ...
 
 
+# ---------------------------------------------------------------------------
+# LLM utility functions
+# ---------------------------------------------------------------------------
+
+def extract_cypher_from_text(text: str) -> str:
+    """Extract a Cypher query from LLM-generated text.
+
+    Handles fenced code blocks (````cypher``, ````sql``, or plain ` ``` `),
+    inline backtick spans, and line-anchored Cypher as fallback.
+
+    Parameters
+    ----------
+    text:
+        Raw LLM output.
+
+    Returns
+    -------
+    str
+        Extracted Cypher string (stripped), or the original text when no
+        recognisable pattern is found.
+    """
+    ...
+
+
+def format_records(
+    records: List[Dict[str, Any]],
+    format: str = "markdown",
+) -> str:
+    """Format Neo4j result records as a string for LLM context.
+
+    Parameters
+    ----------
+    records:
+        Records as returned by :meth:`Neo4jDatabase.execute`.
+    format:
+        One of ``"markdown"`` (default), ``"csv"``, ``"json"``, ``"text"``.
+
+    Returns
+    -------
+    str
+        Formatted string, or ``""`` when *records* is empty.
+
+    Raises
+    ------
+    ValueError
+        For an unrecognised *format*.
+    """
+    ...
+
+
+def repair_cypher(
+    validator: CypherValidator,
+    query: str,
+    llm_fn: Any,
+    max_retries: int = 3,
+) -> Tuple[str, ValidationResult]:
+    """Validate a Cypher query and use an LLM to repair it when invalid.
+
+    Parameters
+    ----------
+    validator:
+        :class:`CypherValidator` instance.
+    query:
+        Initial query string (possibly invalid).
+    llm_fn:
+        Callable ``(query: str, errors: list[str]) -> str`` that returns
+        a repaired query.
+    max_retries:
+        Maximum number of repair attempts.
+
+    Returns
+    -------
+    tuple[str, ValidationResult]
+        ``(final_query, final_result)`` after at most *max_retries* iterations.
+    """
+    ...
+
+
+def cypher_tool_spec(
+    schema: Optional[Schema] = None,
+    db_description: str = "",
+    format: str = "anthropic",
+) -> Dict[str, Any]:
+    """Build a tool/function-call specification for Cypher execution.
+
+    Parameters
+    ----------
+    schema:
+        Optional schema embedded in the tool description.
+    db_description:
+        Short description of the database.
+    format:
+        ``"anthropic"`` (default) or ``"openai"``.
+
+    Returns
+    -------
+    dict
+        Tool specification dict ready for the chosen LLM API.
+    """
+    ...
+
+
+def few_shot_examples(
+    generator: CypherGenerator,
+    n: int = 5,
+    query_type: Optional[str] = None,
+) -> List[Tuple[str, str]]:
+    """Generate ``(natural_language_description, cypher)`` pairs.
+
+    Parameters
+    ----------
+    generator:
+        :class:`CypherGenerator` instance.
+    n:
+        Number of examples to produce.
+    query_type:
+        Restrict to this query type.  ``None`` spreads across all types.
+
+    Returns
+    -------
+    list[tuple[str, str]]
+        ``[(description, cypher), ...]``
+    """
+    ...
+
+
+# ---------------------------------------------------------------------------
+# Graph RAG pipeline
+# ---------------------------------------------------------------------------
+
+class GraphRAGPipeline:
+    """End-to-end Graph RAG pipeline: NL question → Cypher → execute → answer.
+
+    Parameters
+    ----------
+    schema:
+        Graph schema used for context injection and validation.
+    db:
+        :class:`Neo4jDatabase` connection.
+    llm_fn:
+        Callable ``(prompt: str) -> str`` wrapping your chosen LLM.
+    max_repair_retries:
+        Maximum LLM repair attempts for invalid queries (default: 2).
+    result_format:
+        Format for query results injected into the answer prompt.
+    cypher_system_prompt:
+        Override the default Cypher-generation system prompt.
+    answer_system_prompt:
+        Override the default answer-synthesis system prompt.
+
+    Examples
+    --------
+    ::
+
+        pipeline = GraphRAGPipeline(schema=schema, db=db, llm_fn=my_llm)
+        answer = pipeline.query("Who works for Acme Corp?")
+
+        ctx = pipeline.query_with_context("Who works for Acme Corp?")
+        print(ctx["cypher"], ctx["answer"])
+    """
+
+    schema: Any
+    db: Any
+    llm_fn: Any
+    max_repair_retries: int
+    result_format: str
+
+    def __init__(
+        self,
+        schema: Any,
+        db: Any,
+        llm_fn: Any,
+        *,
+        max_repair_retries: int = 2,
+        result_format: str = "markdown",
+        cypher_system_prompt: Optional[str] = None,
+        answer_system_prompt: Optional[str] = None,
+    ) -> None: ...
+
+    def query(self, question: str) -> str:
+        """Run the full pipeline and return a natural language answer."""
+        ...
+
+    def query_with_context(self, question: str) -> Dict[str, Any]:
+        """Run the pipeline and return all intermediate artefacts.
+
+        Returns a dict with keys: ``question``, ``cypher``, ``is_valid``,
+        ``validation_errors``, ``repair_attempts``, ``records``,
+        ``formatted_results``, ``answer``, ``execution_error``.
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+
+
 __all__ = [
     "Schema",
     "CypherValidator",
@@ -542,4 +766,12 @@ __all__ = [
     "GLiNER2RelationExtractor",
     "RelationToCypherConverter",
     "NLToCypher",
+    # LLM utilities
+    "extract_cypher_from_text",
+    "format_records",
+    "repair_cypher",
+    "cypher_tool_spec",
+    "few_shot_examples",
+    # RAG pipeline
+    "GraphRAGPipeline",
 ]

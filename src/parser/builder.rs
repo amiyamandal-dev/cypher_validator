@@ -615,8 +615,8 @@ fn build_comparison_expr(pair: Pair<Rule>) -> Result<Expr, CypherError> {
     let mut result = first;
     loop {
         let op_pair = match children.next() {
-            Some(p) if p.as_rule() == Rule::comparison_op => p,
-            _ => break,
+            Some(p) => p,
+            None => break,
         };
         let right_pair = match children.next() {
             Some(p) => p,
@@ -632,8 +632,6 @@ fn build_comparison_expr(pair: Pair<Rule>) -> Result<Expr, CypherError> {
             ">" => Expr::Gt(Box::new(result), Box::new(right)),
             ">=" => Expr::Gte(Box::new(result), Box::new(right)),
             "=~" => Expr::Regex(Box::new(result), Box::new(right)),
-            "IS NULL" => { let _ = right; Expr::IsNull(Box::new(result)) }
-            "IS NOT NULL" => { let _ = right; Expr::IsNotNull(Box::new(result)) }
             "IN" => Expr::In(Box::new(result), Box::new(right)),
             s if s.starts_with("STARTS") => Expr::StartsWith(Box::new(result), Box::new(right)),
             s if s.starts_with("ENDS") => Expr::EndsWith(Box::new(result), Box::new(right)),
@@ -716,6 +714,14 @@ fn build_postfix_expr(pair: Pair<Rule>) -> Result<Expr, CypherError> {
                 let op = child.into_inner().next()
                     .ok_or_else(|| CypherError::ParseError("Empty postfix_op".into()))?;
                 match op.as_rule() {
+                    Rule::null_check_op => {
+                        let text = op.as_str().to_uppercase();
+                        result = if text.contains("NOT") {
+                            Expr::IsNotNull(Box::new(result))
+                        } else {
+                            Expr::IsNull(Box::new(result))
+                        };
+                    }
                     Rule::property_lookup => {
                         let key = op.into_inner().next()
                             .ok_or_else(|| CypherError::ParseError("Property lookup missing key".into()))?

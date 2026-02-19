@@ -1,6 +1,6 @@
 # cypher_validator
 
-A fast, schema-aware **Cypher query validator and generator** with optional **GLiNER2 relation-extraction** support for natural-language-to-Cypher pipelines.
+A fast, schema-aware **Cypher query validator and generator** with optional **GLiNER2 relation-extraction** and **Graph RAG** support for LLM-driven graph database applications.
 
 The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.rs/) and [maturin](https://github.com/PyO3/maturin)) for performance. The GLiNER2 integration layer is pure Python and is an optional add-on.
 
@@ -18,9 +18,18 @@ The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.r
   - [CypherGenerator](#cyphergenerator)
   - [parse\_query / QueryInfo](#parse_query--queryinfo)
 - [GLiNER2 integration](#gliner2-integration)
-  - [RelationToCypherConverter](#relationtocypherconverter)
+  - [**NLToCypher** ← start here](#nltocypher)
   - [GLiNER2RelationExtractor](#gliner2relationextractor)
-  - [NLToCypher](#nltocypher)
+  - [RelationToCypherConverter](#relationtocypherconverter)
+  - [Neo4jDatabase](#neo4jdatabase)
+- [LLM integration](#llm-integration)
+  - [Schema prompt helpers](#schema-prompt-helpers)
+  - [extract\_cypher\_from\_text](#extract_cypher_from_text)
+  - [repair\_cypher](#repair_cypher)
+  - [format\_records](#format_records)
+  - [few\_shot\_examples](#few_shot_examples)
+  - [cypher\_tool\_spec](#cypher_tool_spec)
+  - [GraphRAGPipeline](#graphragpipeline)
 - [What the validator checks](#what-the-validator-checks)
 - [Generated query types](#generated-query-types)
 - [Performance](#performance)
@@ -40,9 +49,17 @@ The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.r
 | **Batch validation** | `validate_batch()` validates many queries in parallel using Rayon, releasing the Python GIL for the duration |
 | **Query generation** | Generates syntactically correct and schema-valid Cypher queries for 13 common patterns |
 | **Schema-free parsing** | Extracts labels, relationship types, and property keys from any query without requiring a schema |
-| **Schema serialization** | `Schema.to_dict()` and `Schema.from_dict()` enable round-trip JSON serialization |
+| **Schema serialization** | `Schema.to_dict()`, `from_dict()`, `to_json()`, `from_json()`, and `merge()` for complete schema lifecycle management |
 | **NL → Cypher** | Converts GLiNER2 relation-extraction output to MATCH / MERGE / CREATE queries with automatic deduplication |
 | **Zero-shot RE** | Wraps the `gliner2` model for natural-language relation extraction (optional) |
+| **LLM schema context** | `to_prompt()`, `to_markdown()`, `to_cypher_context()` format the schema for LLM system prompts |
+| **Cypher extraction** | `extract_cypher_from_text()` pulls Cypher out of any LLM response (fenced blocks, inline, plain text) |
+| **Self-repair loop** | `repair_cypher()` feeds validation errors back to an LLM for iterative self-correction |
+| **Result formatting** | `format_records()` renders Neo4j results as Markdown, CSV, JSON, or plain text for LLM context |
+| **Few-shot examples** | `few_shot_examples()` auto-generates (description, Cypher) pairs for LLM prompting |
+| **Tool spec builder** | `cypher_tool_spec()` produces Anthropic / OpenAI function-calling schemas for Cypher execution |
+| **Graph RAG pipeline** | `GraphRAGPipeline` chains schema injection → Cypher generation → validation → execution → answer |
+| **Schema introspection** | `Neo4jDatabase.introspect_schema()` discovers the live DB schema automatically |
 | **Type stubs** | Full `.pyi` stub files for IDE autocompletion and mypy / pyright type checking |
 
 ---
@@ -131,7 +148,18 @@ print(gen.generate("match_relationship"))
 # Generate many queries at once (avoids per-call Python overhead)
 batch = gen.generate_batch("match_return", 100)
 
-# 8. Parse without a schema — also extracts property keys
+# 8. NL → Cypher with GLiNER2 (no boilerplate — this is the recommended entry point)
+from cypher_validator import NLToCypher
+pipeline = NLToCypher.from_pretrained("fastino/gliner2-large-v1", schema=schema)
+cypher = pipeline(
+    "Tom Hanks acted in Cast Away.",
+    ["acted_in"],
+    mode="merge",
+)
+# MERGE (a0:Person {name: $a0_val})-[:ACTED_IN]->(b0:Movie {name: $b0_val})
+# RETURN a0, b0
+
+# 10. Parse without a schema — also extracts property keys
 info = parse_query("MATCH (p:Person)-[:ACTED_IN]->(m:Movie) RETURN p.name, m.year")
 print(info.is_valid)        # True
 print(info.labels_used)     # ['Movie', 'Person']
@@ -441,7 +469,10 @@ info.properties_used
 
 ## GLiNER2 integration
 
-The GLiNER2 integration converts relation-extraction results into Cypher queries. It consists of three classes, each usable independently.
+The GLiNER2 integration converts relation-extraction results into Cypher queries.
+
+> **Most users should start with [`NLToCypher`](#nltocypher)** — it wraps all three classes into a single callable that goes from raw text to Cypher (and optionally executes it against Neo4j) in one line.
+> `RelationToCypherConverter` and `GLiNER2RelationExtractor` are lower-level building blocks exposed for advanced use cases.
 
 ### RelationToCypherConverter
 
@@ -462,26 +493,29 @@ results = {
 # Without schema (no node labels)
 converter = RelationToCypherConverter()
 
+# All three methods return (cypher_str, params_dict) — entity values are
+# passed as $param placeholders to prevent Cypher injection.
+
 # ── MATCH mode (find existing data) ────────────────────────────────────────
-print(converter.to_match_query(results))
-# MATCH (a0 {name: "John"})-[:WORKS_FOR]->(b0 {name: "Apple Inc."})
-# MATCH (a1 {name: "John"})-[:LIVES_IN]->(b1 {name: "San Francisco"})
+cypher, params = converter.to_match_query(results)
+print(cypher)
+# MATCH (a0 {name: $a0_val})-[:WORKS_FOR]->(b0 {name: $b0_val})
+# MATCH (a1 {name: $a1_val})-[:LIVES_IN]->(b1 {name: $b1_val})
 # RETURN a0, b0, a1, b1
+print(params)
+# {"a0_val": "John", "b0_val": "Apple Inc.", "a1_val": "John", "b1_val": "San Francisco"}
 
 # ── MERGE mode (upsert) ────────────────────────────────────────────────────
-print(converter.to_merge_query(results))
-# MERGE (a0 {name: "John"})-[:WORKS_FOR]->(b0 {name: "Apple Inc."})
-# MERGE (a1 {name: "John"})-[:LIVES_IN]->(b1 {name: "San Francisco"})
-# RETURN a0, b0, a1, b1
+cypher, params = converter.to_merge_query(results)
 
 # ── CREATE mode (insert new) ───────────────────────────────────────────────
-print(converter.to_create_query(results))
-# CREATE (a0 {name: "John"})-[:WORKS_FOR]->(b0 {name: "Apple Inc."})
-# CREATE (a1 {name: "John"})-[:LIVES_IN]->(b1 {name: "San Francisco"})
-# RETURN a0, b0, a1, b1
+cypher, params = converter.to_create_query(results)
 
 # ── Unified dispatcher ─────────────────────────────────────────────────────
-cypher = converter.convert(results, mode="merge")
+cypher, params = converter.convert(results, mode="merge")
+
+# Pass both to Neo4jDatabase.execute() — the driver handles escaping:
+# results = db.execute(cypher, params)
 ```
 
 **With a schema** — node labels are added automatically:
@@ -495,9 +529,10 @@ schema = Schema(
     },
 )
 converter = RelationToCypherConverter(schema=schema)
-print(converter.to_merge_query(results))
-# MERGE (a0:Person {name: "John"})-[:WORKS_FOR]->(b0:Company {name: "Apple Inc."})
-# MERGE (a1:Person {name: "John"})-[:LIVES_IN]->(b1:City {name: "San Francisco"})
+cypher, params = converter.to_merge_query(results)
+print(cypher)
+# MERGE (a0:Person {name: $a0_val})-[:WORKS_FOR]->(b0:Company {name: $b0_val})
+# MERGE (a1:Person {name: $a1_val})-[:LIVES_IN]->(b1:City {name: $b1_val})
 # RETURN a0, b0, a1, b1
 ```
 
@@ -513,11 +548,14 @@ results = {
         ],
     }
 }
-print(converter.to_merge_query(results))
-# MERGE (a0:Person {name: "John"})-[:WORKS_FOR]->(b0:Company {name: "Microsoft"})
-# MERGE (a1:Person {name: "Mary"})-[:WORKS_FOR]->(b1:Company {name: "Google"})
-# MERGE (a2:Person {name: "Bob"})-[:WORKS_FOR]->(b2:Company {name: "Apple"})
+cypher, params = converter.to_merge_query(results)
+print(cypher)
+# MERGE (a0:Person {name: $a0_val})-[:WORKS_FOR]->(b0:Company {name: $b0_val})
+# MERGE (a1:Person {name: $a1_val})-[:WORKS_FOR]->(b1:Company {name: $b1_val})
+# MERGE (a2:Person {name: $a2_val})-[:WORKS_FOR]->(b2:Company {name: $b2_val})
 # RETURN a0, b0, a1, b1, a2, b2
+print(params)
+# {"a0_val": "John", "b0_val": "Microsoft", "a1_val": "Mary", ...}
 ```
 
 **Automatic deduplication:**
@@ -608,6 +646,8 @@ results = extractor.extract_relations(
 
 ### NLToCypher
 
+> **This is the recommended entry point for most users.** It wraps the extractor and converter into one callable — you only need to supply text, relation types, and a mode.
+
 End-to-end pipeline combining `GLiNER2RelationExtractor` and `RelationToCypherConverter`.
 
 ```python
@@ -633,8 +673,8 @@ cypher = pipeline(
     relation_types=["works_for", "lives_in"],
     mode="merge",
 )
-# MERGE (a0:Person {name: "John"})-[:WORKS_FOR]->(b0:Company {name: "Apple Inc."})
-# MERGE (a1:Person {name: "John"})-[:LIVES_IN]->(b1:City {name: "San Francisco"})
+# MERGE (a0:Person {name: $a0_val})-[:WORKS_FOR]->(b0:Company {name: $b0_val})
+# MERGE (a1:Person {name: $a1_val})-[:LIVES_IN]->(b1:City {name: $b1_val})
 # RETURN a0, b0, a1, b1
 
 # Get both the raw extraction dict and the Cypher string
@@ -646,7 +686,7 @@ relations, cypher = pipeline.extract_and_convert(
 print(relations)
 # {"relation_extraction": {"manages": [("Alice", "Engineering team")], "reports_to": []}}
 print(cypher)
-# MATCH (a0 {name: "Alice"})-[:MANAGES]->(b0 {name: "Engineering team"})
+# MATCH (a0 {name: $a0_val})-[:MANAGES]->(b0 {name: $b0_val})
 # RETURN a0, b0
 
 # High-precision extraction
@@ -675,7 +715,7 @@ cypher, records = pipeline(
     mode="create",
     execute=True,
 )
-# cypher  → 'CREATE (a0:Person {name: "John"})-[:WORKS_FOR]->(b0:Company {name: "Apple Inc."})\nRETURN a0, b0'
+# cypher  → 'CREATE (a0:Person {name: $a0_val})-[:WORKS_FOR]->(b0:Company {name: $b0_val})\nRETURN a0, b0'
 # records → [{"a0": {...}, "b0": {...}}]  (Neo4j driver records as dicts)
 ```
 
@@ -764,6 +804,312 @@ all_results = db.execute_many(
 | `execute(cypher, parameters=None)` | Run one query, return `list[dict]` |
 | `execute_many(queries, parameters_list=None)` | Run multiple queries, return `list[list[dict]]` |
 | `close()` | Release driver connections |
+
+---
+
+## LLM integration
+
+`cypher_validator` ships a dedicated set of helpers for building LLM-driven graph applications. All utilities are importable directly from the top-level package.
+
+```python
+from cypher_validator import (
+    extract_cypher_from_text,
+    format_records,
+    repair_cypher,
+    cypher_tool_spec,
+    few_shot_examples,
+    GraphRAGPipeline,
+)
+```
+
+---
+
+### Schema prompt helpers
+
+Three methods on `Schema` format the graph model for LLM system prompts. Each targets a different LLM style:
+
+```python
+from cypher_validator import Schema
+
+schema = Schema(
+    nodes={"Person": ["name", "age"], "Company": ["name", "founded"]},
+    relationships={"WORKS_FOR": ("Person", "Company", ["since", "role"])},
+)
+
+# ── Readable text (best for general-purpose LLMs) ─────────────────────────
+print(schema.to_prompt())
+# Graph Schema
+# ============
+#
+# Nodes
+# -----
+#   :Person                     name, age
+#   :Company                    name, founded
+#
+# Relationships
+# -------------
+#   :WORKS_FOR                  (Person)-->(Company)   since, role
+
+# ── Markdown table (great for docs and chat UIs) ──────────────────────────
+print(schema.to_markdown())
+# ### Nodes
+# | Label | Properties |
+# |---|---|
+# | :Company | founded, name |
+# | :Person | age, name |
+#
+# ### Relationships
+# | Type | Source → Target | Properties |
+# |---|---|---|
+# | :WORKS_FOR | :Person → :Company | role, since |
+
+# ── Inline Cypher patterns (best for LLMs that know Cypher) ───────────────
+print(schema.to_cypher_context())
+# // Node labels and their properties
+# (:Company {founded, name})
+# (:Person {age, name})
+#
+# // Relationship types
+# (:Person)-[:WORKS_FOR {role, since}]->(:Company)
+```
+
+Inject the output directly into your LLM system prompt:
+
+```python
+system_prompt = f"""You are a Cypher expert. Use this schema:
+
+{schema.to_cypher_context()}
+
+Rules: return ONLY the Cypher query inside a ```cypher code fence."""
+```
+
+---
+
+### extract\_cypher\_from\_text
+
+Parses a raw LLM response and returns the Cypher query string, regardless of how the LLM formatted its output:
+
+```python
+from cypher_validator import extract_cypher_from_text
+
+# Fenced code block (most common)
+extract_cypher_from_text("""
+Sure! Here is the query:
+```cypher
+MATCH (p:Person)-[:WORKS_FOR]->(c:Company)
+RETURN p.name, c.name
+```
+""")
+# "MATCH (p:Person)-[:WORKS_FOR]->(c:Company)\nRETURN p.name, c.name"
+
+# Inline backtick
+extract_cypher_from_text("Run `MATCH (n:Person) RETURN n` against your DB.")
+# "MATCH (n:Person) RETURN n"
+
+# Line-anchored (no formatting at all)
+extract_cypher_from_text("MATCH (n:Person) RETURN n LIMIT 10")
+# "MATCH (n:Person) RETURN n LIMIT 10"
+```
+
+Handles ` ```cypher `, ` ```sql `, plain ` ``` `, inline backticks, and bare Cypher lines — in that priority order.
+
+---
+
+### repair\_cypher
+
+Validates a query and iteratively asks an LLM to fix it when it is invalid:
+
+```python
+from cypher_validator import CypherValidator, repair_cypher
+
+validator = CypherValidator(schema)
+
+def call_llm(query: str, errors: list[str]) -> str:
+    """Your LLM wrapper — receives the bad query and the error list."""
+    ...
+
+# Start with an LLM-generated query that may contain mistakes
+bad_query = "MATCH (n:Persn)-[:WORKFOR]->(c:Company) RETURN n"
+
+fixed_query, result = repair_cypher(validator, bad_query, call_llm, max_retries=3)
+# validator calls call_llm(bad_query, ["Unknown node label :Persn — did you mean :Person?", ...])
+# then re-validates, retrying up to 3 times
+
+if result.is_valid:
+    print("Repaired:", fixed_query)
+else:
+    print("Could not repair:", result.errors)
+```
+
+The `errors` list passed to your LLM already contains "did you mean?" hints, making self-correction highly effective even with small models.
+
+---
+
+### format\_records
+
+Converts Neo4j result records into a string for injecting into LLM prompts:
+
+```python
+from cypher_validator import format_records
+
+records = db.execute("MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN p.name, c.name LIMIT 3")
+
+# Markdown table (default) — great for chat UIs and Claude
+print(format_records(records))
+# | p.name | c.name    |
+# |--------|-----------|
+# | Alice  | Acme Corp |
+# | Bob    | TechStart |
+
+# CSV — compact for token-limited contexts
+print(format_records(records, format="csv"))
+# p.name,c.name
+# Alice,Acme Corp
+
+# JSON — for structured output or downstream parsing
+print(format_records(records, format="json"))
+
+# Plain text — numbered records
+print(format_records(records, format="text"))
+# Record 1:
+#   p.name: Alice
+#   c.name: Acme Corp
+```
+
+`Neo4jDatabase.execute_and_format()` combines `execute()` and `format_records()` in one step:
+
+```python
+table = db.execute_and_format(
+    "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN p.name, c.name LIMIT 5"
+)
+```
+
+---
+
+### few\_shot\_examples
+
+Generates labelled `(description, cypher)` pairs from your schema for few-shot LLM prompting:
+
+```python
+from cypher_validator import CypherGenerator, few_shot_examples
+
+gen = CypherGenerator(schema, seed=42)
+examples = few_shot_examples(gen, n=6)
+# [
+#   ("Return all :Person and :Company",            "MATCH (n:Person) RETURN n LIMIT 3"),
+#   ("Find :Person matching a property condition",  "MATCH (n:Person) WHERE n.age = 30 RETURN n"),
+#   ("Find :Person connected via :WORKS_FOR",       "MATCH (a:Person)-[r:WORKS_FOR]->(b:Company) RETURN a, r, b"),
+#   ...
+# ]
+
+# Restrict to a specific type
+create_examples = few_shot_examples(gen, n=3, query_type="create")
+
+# Embed in a system prompt
+shots = "\n\n".join(f"Q: {d}\nA:\n```cypher\n{c}\n```" for d, c in examples)
+system_prompt = f"Generate Cypher for this schema.\n\nExamples:\n{shots}"
+```
+
+---
+
+### cypher\_tool\_spec
+
+Builds a tool/function-call specification for Cypher execution that works with both the Anthropic and OpenAI APIs:
+
+```python
+from cypher_validator import cypher_tool_spec
+
+# ── Anthropic tool_use ─────────────────────────────────────────────────────
+tool = cypher_tool_spec(schema, format="anthropic")
+response = client.messages.create(
+    model="claude-opus-4-6",
+    tools=[tool],
+    messages=[{"role": "user", "content": "Who works for Acme Corp?"}],
+)
+# When the model calls the tool:
+# tool_input["cypher"]     → the generated Cypher query
+# tool_input["parameters"] → optional $param values
+
+# ── OpenAI function calling ────────────────────────────────────────────────
+tool = cypher_tool_spec(schema, format="openai")
+response = openai.chat.completions.create(
+    model="gpt-4o",
+    tools=[tool],
+    messages=[{"role": "user", "content": "Who works for Acme Corp?"}],
+)
+
+# Optional: describe the database for better LLM guidance
+tool = cypher_tool_spec(schema, db_description="HR knowledge graph", format="anthropic")
+```
+
+The schema's `to_cypher_context()` output is embedded in the tool description automatically when `schema` is provided, so the LLM knows exactly which labels and types to use.
+
+---
+
+### GraphRAGPipeline
+
+The highest-level interface: a complete Graph RAG loop in a single class.
+
+```python
+from cypher_validator import GraphRAGPipeline, Neo4jDatabase, Schema
+
+def call_llm(prompt: str) -> str:
+    """Wrap your LLM here — must accept a string and return a string."""
+    # e.g. via the Anthropic or OpenAI SDK
+    ...
+
+schema = Schema(
+    nodes={"Person": ["name"], "Company": ["name"]},
+    relationships={"WORKS_FOR": ("Person", "Company", [])},
+)
+db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+
+pipeline = GraphRAGPipeline(schema=schema, db=db, llm_fn=call_llm)
+
+# Simple call — returns a natural language answer
+answer = pipeline.query("Who works for Acme Corp?")
+
+# Full context — returns all intermediate artefacts
+ctx = pipeline.query_with_context("Who works for Acme Corp?")
+print(ctx["cypher"])             # The generated (and possibly repaired) Cypher
+print(ctx["repair_attempts"])    # Number of LLM repair iterations (0 = first try valid)
+print(ctx["records"])            # Raw Neo4j records
+print(ctx["formatted_results"])  # Markdown table injected into the answer prompt
+print(ctx["answer"])             # Final LLM-generated answer
+print(ctx["execution_error"])    # None, or error message if Neo4j raised
+```
+
+**What happens internally on each `query()` call:**
+
+1. Schema is formatted via `to_cypher_context()` and injected into the system prompt.
+2. LLM generates a Cypher query (first call).
+3. `extract_cypher_from_text()` extracts the Cypher from the response.
+4. `CypherValidator` validates it — if invalid, the LLM is asked to fix it (up to `max_repair_retries` times).
+5. The validated query is executed against Neo4j.
+6. Results are formatted with `format_records()` and injected into the answer prompt.
+7. LLM generates the final answer (second call).
+
+**Constructor parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `schema` | required | Graph schema for context injection and validation |
+| `db` | required | `Neo4jDatabase` for executing queries |
+| `llm_fn` | required | `Callable[[str], str]` — your LLM wrapper |
+| `max_repair_retries` | `2` | Max LLM repair attempts for invalid queries |
+| `result_format` | `"markdown"` | Format passed to `format_records()` |
+| `cypher_system_prompt` | auto | Override the Cypher-generation system prompt |
+| `answer_system_prompt` | auto | Override the answer-synthesis system prompt |
+
+**Auto-discovering the schema from a live database:**
+
+```python
+db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+schema = db.introspect_schema()   # discovers labels, properties, and relationships
+pipeline = GraphRAGPipeline(schema=schema, db=db, llm_fn=call_llm)
+```
+
+`introspect_schema()` tries the built-in `db.schema.*` procedures first (Neo4j 4.3+) and falls back to sampling existing nodes and relationships.
 
 ---
 
@@ -945,12 +1291,16 @@ cypher_validator/
 │
 ├── python/
 │   └── cypher_validator/             # Python package (maturin python-source)
-│       ├── __init__.py               # Re-exports Rust core + GLiNER2 classes
-│       ├── __init__.pyi              # Package-level type stubs
+│       ├── __init__.py               # Re-exports Rust core + GLiNER2 + LLM helpers
+│       ├── __init__.pyi              # Package-level type stubs (all classes and functions)
 │       ├── _cypher_validator.pyi     # Rust extension type stubs
-│       └── gliner2_integration.py   # RelationToCypherConverter, GLiNER2RelationExtractor, NLToCypher
+│       ├── gliner2_integration.py   # RelationToCypherConverter, GLiNER2RelationExtractor,
+│       │                             #   NLToCypher, Neo4jDatabase (incl. introspect_schema)
+│       ├── llm_utils.py              # extract_cypher_from_text, format_records,
+│       │                             #   repair_cypher, cypher_tool_spec, few_shot_examples
+│       └── rag.py                    # GraphRAGPipeline
 │
-└── tests/                            # 261 tests total
+└── tests/                            # 356 tests total
     ├── test_syntax.py                # PEG grammar / syntax tests
     ├── test_schema.py                # Schema API tests
     ├── test_validator.py             # Validator smoke tests
@@ -958,8 +1308,12 @@ cypher_validator/
     ├── test_generator.py             # CypherGenerator tests (all 13 types)
     ├── test_roundtrip.py             # Generator output validated by validator
     ├── test_gliner2_integration.py   # GLiNER2 integration tests (no ML required)
+    ├── test_neo4j_integration.py     # Neo4jDatabase and NLToCypher execute=True tests
     ├── test_task2_features.py        # AND/OR grammar fix, Schema.from_dict, validate_batch, properties_used
-    └── test_task3_features.py        # "Did you mean", new generator types, deduplication
+    ├── test_task3_features.py        # "Did you mean", new generator types, deduplication
+    ├── test_llm_utils.py             # extract_cypher_from_text, format_records, repair_cypher,
+    │                                 #   cypher_tool_spec, few_shot_examples, Schema prompt methods
+    └── test_rag.py                   # GraphRAGPipeline — construction, query, repair loop, error handling
 ```
 
 ---
@@ -982,7 +1336,7 @@ maturin build --release
 ### Running tests
 
 ```bash
-# All 283 tests
+# All 356 tests
 pytest tests/
 
 # Specific test modules

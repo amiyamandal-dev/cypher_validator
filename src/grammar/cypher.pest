@@ -146,8 +146,6 @@ comparison_expr = {
 
 comparison_op = {
     "<=" | ">=" | "<>" | "<" | ">" | "=" | "=~"
-  | (^"IS" ~ ^"NOT" ~ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_"))
-  | (^"IS" ~ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_"))
   | (^"IN" ~ !(ASCII_ALPHANUMERIC | "_"))
   | (^"STARTS" ~ ^"WITH" ~ !(ASCII_ALPHANUMERIC | "_"))
   | (^"ENDS" ~ ^"WITH" ~ !(ASCII_ALPHANUMERIC | "_"))
@@ -163,8 +161,20 @@ unary_expr   = { "-"? ~ postfix_expr }
 
 postfix_expr = { atom ~ postfix_op* }
 
+// IS NULL / IS NOT NULL are postfix unary operators — they have no right-hand
+// operand. The rule is ATOMIC (@{}) so pest does not insert implicit WHITESPACE
+// between the keyword tokens and the negative lookahead; otherwise the implicit
+// WHITESPACE* before !(…) would advance past the space after NULL and then fail
+// on the first letter of the next token (e.g. 'R' in RETURN).
+// The inter-keyword whitespace is matched explicitly (same pattern as WHITESPACE).
+null_check_op = @{
+    ^"IS" ~ (" " | "\t" | "\r" | "\n")+ ~ ^"NOT" ~ (" " | "\t" | "\r" | "\n")+ ~ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_")
+  | ^"IS" ~ (" " | "\t" | "\r" | "\n")+ ~ ^"NULL" ~ !(ASCII_ALPHANUMERIC | "_")
+}
+
 postfix_op   = {
-    property_lookup
+    null_check_op
+  | property_lookup
   | subscript_op
   | list_slice_op
 }

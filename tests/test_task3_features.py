@@ -195,26 +195,29 @@ CROSS_TYPE_DUPE = {
 class TestConverterDeduplication:
     def test_match_deduplicates_exact_pairs(self):
         conv = RelationToCypherConverter()
-        q = conv.to_match_query(DUPED_RELATIONS)
+        q, params = conv.to_match_query(DUPED_RELATIONS)
         # John→Apple appears twice in input but only once in output after dedup
-        assert q.count('"John"') == 1   # deduped: John-Apple only once
-        assert q.count('"Mary"') == 1   # Mary-Google is a unique pair
+        assert list(params.values()).count("John") == 1   # deduped: John-Apple only once
+        assert list(params.values()).count("Mary") == 1   # Mary-Google is a unique pair
         assert q.count("MATCH") == 2    # two distinct pairs (John-Apple + Mary-Google)
+        # Values must be in params, NOT embedded as literals in the query string
+        assert '"John"' not in q
+        assert '"Mary"' not in q
 
     def test_merge_deduplicates_exact_pairs(self):
         conv = RelationToCypherConverter()
-        q = conv.to_merge_query(DUPED_RELATIONS)
+        q, params = conv.to_merge_query(DUPED_RELATIONS)
         assert q.count("MERGE") == 2    # John-Apple once, Mary-Google once
 
     def test_create_deduplicates_exact_pairs(self):
         conv = RelationToCypherConverter()
-        q = conv.to_create_query(DUPED_RELATIONS)
+        q, params = conv.to_create_query(DUPED_RELATIONS)
         assert q.count("CREATE") == 2
 
     def test_cross_type_deduplication_independent(self):
         """Duplicates within each relation type are deduplicated independently."""
         conv = RelationToCypherConverter()
-        q = conv.to_match_query(CROSS_TYPE_DUPE)
+        q, params = conv.to_match_query(CROSS_TYPE_DUPE)
         # John-Apple (WORKS_FOR) and John-NYC (LIVES_IN) each appear once
         assert q.count("MATCH") == 2
 
@@ -230,7 +233,7 @@ class TestConverterDeduplication:
             }
         }
         conv = RelationToCypherConverter()
-        q = conv.to_match_query(relations)
+        q, params = conv.to_match_query(relations)
         assert q.count("MATCH") == 3
 
     def test_dedup_per_rel_type(self):
@@ -242,7 +245,7 @@ class TestConverterDeduplication:
             }
         }
         conv = RelationToCypherConverter()
-        q = conv.to_match_query(relations)
+        q, params = conv.to_match_query(relations)
         assert q.count("MATCH") == 2    # one per distinct (subj, obj, rel_type)
 
     def test_empty_after_dedup_returns_empty(self):
@@ -257,6 +260,27 @@ class TestConverterDeduplication:
         }
         conv = RelationToCypherConverter()
         # After dedup: only one pair remains, so output is NOT empty
-        q = conv.to_match_query(all_dupes)
+        q, params = conv.to_match_query(all_dupes)
         assert q != ""
         assert q.count("MATCH") == 1
+
+    def test_no_injection_via_entity_name(self):
+        """Adversarial entity names must not alter the query structure."""
+        malicious = {
+            "relation_extraction": {
+                "works_for": [
+                    ('Alice" OR 1=1 OR "x', "Apple"),
+                    ("Bob", 'Acme"})-[:ADMIN]->(x'),
+                ]
+            }
+        }
+        conv = RelationToCypherConverter()
+        q, params = conv.to_match_query(malicious)
+        # Malicious strings land in params, never in the query template
+        assert 'OR 1=1' not in q
+        assert 'ADMIN' not in q
+        assert any("OR 1=1" in v for v in params.values())
+        assert any("ADMIN" in v for v in params.values())
+        # Query must only contain $ placeholders, not the raw values
+        assert "$" in q
+        assert q.count("MATCH") == 2

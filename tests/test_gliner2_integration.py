@@ -85,57 +85,58 @@ EMPTY = {
 
 class TestMatchQuery:
     def test_keywords_present(self, converter):
-        q = converter.to_match_query(SINGLE_PAIR)
+        q, params = converter.to_match_query(SINGLE_PAIR)
         assert "MATCH" in q
         assert ":WORKS_FOR" in q
         assert "RETURN" in q
 
     def test_entities_appear(self, converter):
-        q = converter.to_match_query(SINGLE_PAIR)
-        assert '"John"' in q
-        assert '"Apple Inc."' in q
+        # Entity values are in params (parameterized query), not embedded in q
+        q, params = converter.to_match_query(SINGLE_PAIR)
+        assert "John" in params.values()
+        assert "Apple Inc." in params.values()
 
     def test_rel_type_uppercased(self, converter):
-        q = converter.to_match_query(SINGLE_PAIR)
+        q, params = converter.to_match_query(SINGLE_PAIR)
         assert ":WORKS_FOR" in q
         assert ":works_for" not in q
 
     def test_two_types_give_two_match_clauses(self, converter):
-        q = converter.to_match_query(TWO_TYPES)
+        q, params = converter.to_match_query(TWO_TYPES)
         assert q.count("MATCH") == 2
         assert ":WORKS_FOR" in q
         assert ":LIVES_IN" in q
 
     def test_multiple_pairs_same_type_give_multiple_clauses(self, converter):
-        q = converter.to_match_query(MULTI_PAIRS)
+        q, params = converter.to_match_query(MULTI_PAIRS)
         # One MATCH clause per pair
         assert q.count("MATCH") == 3
-        assert '"John"' in q
-        assert '"Mary"' in q
-        assert '"Bob"' in q
+        assert "John" in params.values()
+        assert "Mary" in params.values()
+        assert "Bob" in params.values()
 
     def test_empty_relations_return_empty_string(self, converter):
-        assert converter.to_match_query(EMPTY) == ""
+        assert converter.to_match_query(EMPTY) == ("", {})
 
     def test_custom_return_clause(self, converter):
-        q = converter.to_match_query(SINGLE_PAIR, return_clause="RETURN *")
+        q, params = converter.to_match_query(SINGLE_PAIR, return_clause="RETURN *")
         assert q.endswith("RETURN *")
 
     def test_auto_return_vars(self, converter):
-        q = converter.to_match_query(SINGLE_PAIR)
+        q, params = converter.to_match_query(SINGLE_PAIR)
         # auto return should mention a0 and b0
         assert "a0" in q
         assert "b0" in q
 
     def test_inline_property_map_used(self, converter):
-        # MATCH uses {name: "..."} inline props, not WHERE conditions
-        q = converter.to_match_query(SINGLE_PAIR)
+        # MATCH uses {name: $param} inline props, not WHERE conditions
+        q, params = converter.to_match_query(SINGLE_PAIR)
         assert "WHERE" not in q
         assert "{name:" in q or '{"name"' in q or "name:" in q
 
     def test_missing_relation_extraction_key(self, converter):
         # Top-level key absent → treated as empty
-        assert converter.to_match_query({}) == ""
+        assert converter.to_match_query({}) == ("", {})
 
 
 # ===========================================================================
@@ -144,34 +145,34 @@ class TestMatchQuery:
 
 class TestMergeQuery:
     def test_merge_keyword(self, converter):
-        q = converter.to_merge_query(SINGLE_PAIR)
+        q, params = converter.to_merge_query(SINGLE_PAIR)
         assert "MERGE" in q
 
     def test_entities_and_rel(self, converter):
-        q = converter.to_merge_query(SINGLE_PAIR)
-        assert '"John"' in q
-        assert '"Apple Inc."' in q
+        q, params = converter.to_merge_query(SINGLE_PAIR)
+        assert "John" in params.values()
+        assert "Apple Inc." in params.values()
         assert ":WORKS_FOR" in q
 
     def test_schema_adds_node_labels(self, converter_with_schema):
-        q = converter_with_schema.to_merge_query(SINGLE_PAIR)
+        q, params = converter_with_schema.to_merge_query(SINGLE_PAIR)
         assert ":Person" in q
         assert ":Company" in q
 
     def test_no_schema_no_node_labels(self, converter):
-        q = converter.to_merge_query(SINGLE_PAIR)
+        q, params = converter.to_merge_query(SINGLE_PAIR)
         assert ":Person" not in q
         assert ":Company" not in q
 
     def test_multiple_pairs_give_multiple_merges(self, converter):
-        q = converter.to_merge_query(MULTI_PAIRS)
+        q, params = converter.to_merge_query(MULTI_PAIRS)
         assert q.count("MERGE") == 3
 
     def test_empty_returns_empty_string(self, converter):
-        assert converter.to_merge_query(EMPTY) == ""
+        assert converter.to_merge_query(EMPTY) == ("", {})
 
     def test_custom_return_clause(self, converter):
-        q = converter.to_merge_query(SINGLE_PAIR, return_clause="RETURN *")
+        q, params = converter.to_merge_query(SINGLE_PAIR, return_clause="RETURN *")
         assert q.endswith("RETURN *")
 
 
@@ -181,19 +182,19 @@ class TestMergeQuery:
 
 class TestCreateQuery:
     def test_create_keyword(self, converter):
-        q = converter.to_create_query(SINGLE_PAIR)
+        q, params = converter.to_create_query(SINGLE_PAIR)
         assert "CREATE" in q
 
     def test_schema_adds_labels(self, converter_with_schema):
-        q = converter_with_schema.to_create_query(SINGLE_PAIR)
+        q, params = converter_with_schema.to_create_query(SINGLE_PAIR)
         assert ":Person" in q
         assert ":Company" in q
 
     def test_empty_returns_empty_string(self, converter):
-        assert converter.to_create_query(EMPTY) == ""
+        assert converter.to_create_query(EMPTY) == ("", {})
 
     def test_multiple_pairs_give_multiple_creates(self, converter):
-        q = converter.to_create_query(MULTI_PAIRS)
+        q, params = converter.to_create_query(MULTI_PAIRS)
         assert q.count("CREATE") == 3
 
 
@@ -203,15 +204,15 @@ class TestCreateQuery:
 
 class TestConvertDispatcher:
     def test_match_mode(self, converter):
-        q = converter.convert(SINGLE_PAIR, mode="match")
+        q, params = converter.convert(SINGLE_PAIR, mode="match")
         assert "MATCH" in q
 
     def test_merge_mode(self, converter):
-        q = converter.convert(SINGLE_PAIR, mode="merge")
+        q, params = converter.convert(SINGLE_PAIR, mode="merge")
         assert "MERGE" in q
 
     def test_create_mode(self, converter):
-        q = converter.convert(SINGLE_PAIR, mode="create")
+        q, params = converter.convert(SINGLE_PAIR, mode="create")
         assert "CREATE" in q
 
     def test_unknown_mode_raises_value_error(self, converter):
@@ -219,7 +220,7 @@ class TestConvertDispatcher:
             converter.convert(SINGLE_PAIR, mode="upsert")
 
     def test_kwargs_forwarded_to_generator(self, converter):
-        q = converter.convert(SINGLE_PAIR, mode="match", return_clause="RETURN *")
+        q, params = converter.convert(SINGLE_PAIR, mode="match", return_clause="RETURN *")
         assert q.endswith("RETURN *")
 
 
@@ -230,13 +231,13 @@ class TestConvertDispatcher:
 class TestNameProperty:
     def test_custom_property_in_match(self):
         conv = RelationToCypherConverter(name_property="title")
-        q = conv.to_match_query(SINGLE_PAIR)
-        assert "title:" in q  # inline property map uses {title: "..."}
+        q, params = conv.to_match_query(SINGLE_PAIR)
+        assert "title:" in q  # inline property map uses {title: $param}
         assert "name:" not in q
 
     def test_custom_property_in_merge(self):
         conv = RelationToCypherConverter(name_property="label")
-        q = conv.to_merge_query(SINGLE_PAIR)
+        q, params = conv.to_merge_query(SINGLE_PAIR)
         assert "label:" in q or "{label:" in q
         assert "name:" not in q
 
@@ -247,14 +248,14 @@ class TestNameProperty:
 
 class TestSchemaLabelResolution:
     def test_merge_two_types_correct_labels(self, converter_with_schema):
-        q = converter_with_schema.to_merge_query(TWO_TYPES)
+        q, params = converter_with_schema.to_merge_query(TWO_TYPES)
         assert ":Person" in q
         assert ":Company" in q
         assert ":City" in q
 
     def test_unknown_rel_type_no_labels(self, converter_with_schema):
         rels = {"relation_extraction": {"founded": [("Elon", "Tesla")]}}
-        q = converter_with_schema.to_merge_query(rels)
+        q, params = converter_with_schema.to_merge_query(rels)
         # FOUNDED not in schema → no label annotation
         assert ":FOUNDED" in q  # the rel type is still there
         # No spurious node labels
@@ -414,36 +415,36 @@ class TestGeneratedCypherValidity:
     """Spot-check that converter output is syntactically valid Cypher."""
 
     def test_match_query_parses(self, converter):
-        q = converter.to_match_query(SINGLE_PAIR)
+        q, params = converter.to_match_query(SINGLE_PAIR)
         info = parse_query(q)
         assert info.is_valid, f"Invalid Cypher: {q}\nErrors: {info.errors}"
 
     def test_match_two_types_parses(self, converter):
-        q = converter.to_match_query(TWO_TYPES)
+        q, params = converter.to_match_query(TWO_TYPES)
         info = parse_query(q)
         assert info.is_valid, f"Invalid Cypher: {q}\nErrors: {info.errors}"
 
     def test_match_multi_pairs_parses(self, converter):
-        q = converter.to_match_query(MULTI_PAIRS)
+        q, params = converter.to_match_query(MULTI_PAIRS)
         info = parse_query(q)
         assert info.is_valid, f"Invalid Cypher: {q}\nErrors: {info.errors}"
 
     def test_merge_query_parses(self, converter):
-        q = converter.to_merge_query(SINGLE_PAIR)
+        q, params = converter.to_merge_query(SINGLE_PAIR)
         info = parse_query(q)
         assert info.is_valid, f"Invalid Cypher: {q}\nErrors: {info.errors}"
 
     def test_merge_with_schema_parses(self, converter_with_schema):
-        q = converter_with_schema.to_merge_query(TWO_TYPES)
+        q, params = converter_with_schema.to_merge_query(TWO_TYPES)
         info = parse_query(q)
         assert info.is_valid, f"Invalid Cypher: {q}\nErrors: {info.errors}"
 
     def test_create_query_parses(self, converter):
-        q = converter.to_create_query(SINGLE_PAIR)
+        q, params = converter.to_create_query(SINGLE_PAIR)
         info = parse_query(q)
         assert info.is_valid, f"Invalid Cypher: {q}\nErrors: {info.errors}"
 
     def test_create_multi_pairs_parses(self, converter):
-        q = converter.to_create_query(MULTI_PAIRS)
+        q, params = converter.to_create_query(MULTI_PAIRS)
         info = parse_query(q)
         assert info.is_valid, f"Invalid Cypher: {q}\nErrors: {info.errors}"

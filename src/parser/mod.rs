@@ -17,3 +17,102 @@ pub fn parse(input: &str) -> Result<CypherQuery, CypherError> {
         .ok_or_else(|| CypherError::ParseError("No parse result".into()))?;
     builder::build_query(cypher_pair)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pest::Parser as PestParser;
+
+    fn try_parse(rule: Rule, input: &str) -> bool {
+        <CypherParser as PestParser<Rule>>::parse(rule, input).is_ok()
+    }
+
+    // --- null_check_op unit tests ---
+
+    #[test]
+    fn test_null_check_op_is_null() {
+        assert!(try_parse(Rule::null_check_op, "IS NULL"),    "IS NULL should parse");
+        assert!(try_parse(Rule::null_check_op, "is null"),    "is null (lowercase) should parse");
+        assert!(try_parse(Rule::null_check_op, "IS NOT NULL"),"IS NOT NULL should parse");
+        assert!(try_parse(Rule::null_check_op, "is not null"),"is not null (lowercase) should parse");
+    }
+
+    #[test]
+    fn test_null_check_op_rejects_partial() {
+        // "ISNULL" (no space) must not match — the rule requires at least one whitespace
+        assert!(!try_parse(Rule::null_check_op, "ISNULL"),    "ISNULL without space must not match");
+        assert!(!try_parse(Rule::null_check_op, "ISNOTNULL"), "ISNOTNULL without spaces must not match");
+    }
+
+    // --- postfix_expr tests ---
+
+    #[test]
+    fn test_postfix_expr_is_null_on_variable() {
+        assert!(try_parse(Rule::postfix_expr, "n IS NULL"),    "n IS NULL");
+        assert!(try_parse(Rule::postfix_expr, "n IS NOT NULL"),"n IS NOT NULL");
+    }
+
+    #[test]
+    fn test_postfix_expr_is_null_on_property() {
+        assert!(try_parse(Rule::postfix_expr, "n.age IS NULL"),    "n.age IS NULL");
+        assert!(try_parse(Rule::postfix_expr, "n.age IS NOT NULL"),"n.age IS NOT NULL");
+    }
+
+    // --- where_clause tests ---
+
+    #[test]
+    fn test_where_clause_is_null() {
+        assert!(try_parse(Rule::where_clause, "WHERE n.age IS NULL"));
+        assert!(try_parse(Rule::where_clause, "WHERE n.age IS NOT NULL"));
+        assert!(try_parse(Rule::where_clause, "WHERE n IS NULL"));
+    }
+
+    // --- full cypher query tests ---
+
+    #[test]
+    fn test_full_query_is_null() {
+        assert!(try_parse(Rule::cypher, "MATCH (n:Person) WHERE n.age IS NULL RETURN n"));
+    }
+
+    #[test]
+    fn test_full_query_is_not_null() {
+        assert!(try_parse(Rule::cypher, "MATCH (n:Person) WHERE n.age IS NOT NULL RETURN n"));
+    }
+
+    #[test]
+    fn test_full_query_is_null_lowercase_keywords() {
+        assert!(try_parse(Rule::cypher, "MATCH (n:Person) WHERE n.age is null RETURN n"));
+        assert!(try_parse(Rule::cypher, "MATCH (n:Person) WHERE n.age is not null RETURN n"));
+    }
+
+    #[test]
+    fn test_full_query_is_null_with_and() {
+        assert!(try_parse(Rule::cypher,
+            "MATCH (n:Person) WHERE n.age IS NULL AND n.name IS NOT NULL RETURN n"));
+    }
+
+    #[test]
+    fn test_full_query_is_null_with_or() {
+        assert!(try_parse(Rule::cypher,
+            "MATCH (n:Person) WHERE n.age IS NULL OR n.name IS NOT NULL RETURN n"));
+    }
+
+    #[test]
+    fn test_full_query_is_null_in_relationship_pattern() {
+        assert!(try_parse(Rule::cypher,
+            "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) WHERE p.age IS NOT NULL RETURN p, c"));
+    }
+
+    #[test]
+    fn test_full_query_is_null_in_return() {
+        // IS NULL used as a projected expression, not just in WHERE
+        assert!(try_parse(Rule::cypher,
+            "MATCH (n:Person) RETURN n.age IS NULL"));
+    }
+
+    #[test]
+    fn test_full_query_not_is_null() {
+        assert!(try_parse(Rule::cypher,
+            "MATCH (n:Person) WHERE NOT n.age IS NULL RETURN n"));
+    }
+}

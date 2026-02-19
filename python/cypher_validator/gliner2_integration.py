@@ -149,6 +149,179 @@ class Neo4jDatabase:
             result = session.run(cypher, parameters or {})
             return [dict(record) for record in result]
 
+    def introspect_schema(self, sample_limit: int = 1000) -> "Any":
+        """Discover the graph schema by inspecting the live database.
+
+        Tries the built-in ``db.schema.nodeTypeProperties()`` and
+        ``db.schema.relTypeProperties()`` procedures first (Neo4j 4.3+).
+        Falls back to sampling existing nodes and relationships when those
+        procedures are unavailable (older Neo4j, Memgraph, etc.).
+
+        Parameters
+        ----------
+        sample_limit:
+            Maximum number of node/relationship rows to sample in the
+            fallback path (default: 1000).
+
+        Returns
+        -------
+        Schema
+            A :class:`~cypher_validator.Schema` populated from the live graph.
+
+        Examples
+        --------
+        ::
+
+            db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+            schema = db.introspect_schema()
+            validator = CypherValidator(schema)
+        """
+        from cypher_validator import Schema
+
+        nodes: dict = {}
+        rels: dict = {}
+
+        # ── Attempt 1: built-in schema procedures (Neo4j 4.3+) ──────────
+        try:
+            rows = self.execute(
+                "CALL db.schema.nodeTypeProperties() YIELD nodeType, propertyName"
+            )
+            for row in rows:
+                label = row.get("nodeType", "").strip(":`")
+                prop = row.get("propertyName")
+                if label:
+                    nodes.setdefault(label, [])
+                    if prop and prop not in nodes[label]:
+                        nodes[label].append(prop)
+        except Exception:
+            pass  # procedure not available — fall through to sampling
+
+        # ── Attempt 2: fallback sampling for node labels ─────────────────
+        if not nodes:
+            try:
+                rows = self.execute(
+                    f"MATCH (n) "
+                    f"WITH labels(n) AS lbls, keys(n) AS props "
+                    f"UNWIND lbls AS label "
+                    f"UNWIND (CASE WHEN size(props) = 0 THEN [null] ELSE props END) AS prop "
+                    f"RETURN DISTINCT label, prop "
+                    f"ORDER BY label, prop LIMIT {sample_limit}"
+                )
+                for row in rows:
+                    label = row.get("label") or ""
+                    prop = row.get("prop")
+                    if label:
+                        nodes.setdefault(label, [])
+                        if prop and prop not in nodes[label]:
+                            nodes[label].append(prop)
+            except Exception:
+                pass
+
+        # ── Attempt 3: built-in rel-type properties procedure ────────────
+        try:
+            rows = self.execute(
+                "CALL db.schema.relTypeProperties() YIELD relType, propertyName"
+            )
+            for row in rows:
+                rel_type = row.get("relType", "").strip(":`")
+                prop = row.get("propertyName")
+                if rel_type:
+                    if rel_type not in rels:
+                        rels[rel_type] = ("", "", [])
+                    if prop:
+                        src, tgt, props = rels[rel_type]
+                        if prop not in props:
+                            rels[rel_type] = (src, tgt, props + [prop])
+        except Exception:
+            pass
+
+        # ── Always: discover rel endpoints and missing types via sampling ─
+        try:
+            rows = self.execute(
+                f"MATCH (a)-[r]->(b) "
+                f"RETURN DISTINCT "
+                f"  type(r) AS rel_type, "
+                f"  head(labels(a)) AS src, "
+                f"  head(labels(b)) AS tgt "
+                f"LIMIT {sample_limit}"
+            )
+            for row in rows:
+                rel_type = row.get("rel_type") or ""
+                src = row.get("src") or ""
+                tgt = row.get("tgt") or ""
+                if rel_type:
+                    if rel_type in rels:
+                        _, _, props = rels[rel_type]
+                        rels[rel_type] = (src, tgt, props)
+                    else:
+                        rels[rel_type] = (src, tgt, [])
+        except Exception:
+            pass
+
+        # ── Fallback for rel properties when procedure unavailable ────────
+        if not any(props for _, _, props in rels.values()):
+            try:
+                rows = self.execute(
+                    f"MATCH ()-[r]->() "
+                    f"WITH type(r) AS rel_type, keys(r) AS props "
+                    f"UNWIND (CASE WHEN size(props) = 0 THEN [null] ELSE props END) AS prop "
+                    f"RETURN DISTINCT rel_type, prop "
+                    f"LIMIT {sample_limit}"
+                )
+                for row in rows:
+                    rel_type = row.get("rel_type") or ""
+                    prop = row.get("prop")
+                    if rel_type and rel_type in rels and prop:
+                        src, tgt, props = rels[rel_type]
+                        if prop not in props:
+                            rels[rel_type] = (src, tgt, props + [prop])
+            except Exception:
+                pass
+
+        return Schema(nodes=nodes, relationships=rels)
+
+    def execute_and_format(
+        self,
+        cypher: str,
+        format: str = "markdown",  # noqa: A002
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Execute a Cypher query and return results formatted for LLM context.
+
+        Combines :meth:`execute` and
+        :func:`~cypher_validator.llm_utils.format_records` in one call.
+
+        Parameters
+        ----------
+        cypher:
+            Cypher query string.
+        format:
+            Output format — ``"markdown"`` (default), ``"csv"``, ``"json"``,
+            or ``"text"``.
+        parameters:
+            Optional query parameters.
+
+        Returns
+        -------
+        str
+            Formatted result string, or ``""`` when no rows are returned.
+
+        Examples
+        --------
+        ::
+
+            table = db.execute_and_format(
+                "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN p.name, c.name LIMIT 5"
+            )
+            # | p.name | c.name    |
+            # |--------|-----------|
+            # | Alice  | Acme Corp |
+        """
+        from cypher_validator.llm_utils import format_records
+
+        records = self.execute(cypher, parameters)
+        return format_records(records, format=format)
+
     def execute_many(
         self,
         queries: List[str],
@@ -258,12 +431,14 @@ class RelationToCypherConverter:
         self,
         relations: Dict[str, Any],
         return_clause: Optional[str] = None,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         """Build ``MATCH`` clauses for the extracted relations.
 
         Each (subject, object) pair produces its own ``MATCH`` clause using
-        inline property maps—one clause per pair, regardless of how many pairs
-        share the same relation type.
+        ``$param`` placeholders—one clause per pair, regardless of how many
+        pairs share the same relation type.  Entity values are **never**
+        interpolated directly into the query string, which prevents Cypher
+        injection via adversarial entity names.
 
         Parameters
         ----------
@@ -275,12 +450,16 @@ class RelationToCypherConverter:
 
         Returns
         -------
-        str
-            Cypher query, or ``""`` when nothing was extracted.
+        tuple[str, dict]
+            ``(cypher_query, parameters)`` where *parameters* maps each
+            ``$placeholder`` name to its entity-text value.  Pass both to
+            :meth:`Neo4jDatabase.execute` so the driver handles escaping.
+            Returns ``("", {})`` when nothing was extracted.
         """
         rel_data: Dict[str, List[Any]] = relations.get("relation_extraction", {})
         clauses: List[str] = []
         return_vars: List[str] = []
+        params: Dict[str, Any] = {}
         np = self.name_property
         idx = 0
         seen: set = set()  # (subject, obj, cypher_rel) deduplication
@@ -298,23 +477,26 @@ class RelationToCypherConverter:
                     continue
                 seen.add(key)
                 a_var, b_var = f"a{idx}", f"b{idx}"
+                a_param, b_param = f"{a_var}_val", f"{b_var}_val"
+                params[a_param] = subject
+                params[b_param] = obj
                 clauses.append(
-                    f'MATCH ({a_var} {{{np}: "{subject}"}})'
+                    f'MATCH ({a_var} {{{np}: ${a_param}}})'
                     f"-[:{cypher_rel}]->"
-                    f'({b_var} {{{np}: "{obj}"}})'
+                    f'({b_var} {{{np}: ${b_param}}})'
                 )
                 return_vars.extend([a_var, b_var])
                 idx += 1
 
         if not clauses:
-            return ""
+            return "", {}
 
         ret = (
             return_clause
             if return_clause is not None
             else f"RETURN {', '.join(return_vars)}"
         )
-        return "\n".join(clauses) + f"\n{ret}"
+        return "\n".join(clauses) + f"\n{ret}", params
 
     # ------------------------------------------------------------------
     # MERGE
@@ -324,11 +506,13 @@ class RelationToCypherConverter:
         self,
         relations: Dict[str, Any],
         return_clause: Optional[str] = None,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         """Build ``MERGE`` clauses to upsert extracted entities/relationships.
 
         When a ``schema`` is available and the relation type is known, node
         labels are added automatically (e.g. ``:Person``, ``:Company``).
+        Entity values are passed as ``$param`` placeholders to prevent
+        Cypher injection.
 
         Parameters
         ----------
@@ -339,8 +523,9 @@ class RelationToCypherConverter:
 
         Returns
         -------
-        str
-            Cypher query, or ``""`` when nothing was extracted.
+        tuple[str, dict]
+            ``(cypher_query, parameters)``.  Returns ``("", {})`` when
+            nothing was extracted.
         """
         return self._build_clause("MERGE", relations, return_clause)
 
@@ -352,8 +537,11 @@ class RelationToCypherConverter:
         self,
         relations: Dict[str, Any],
         return_clause: Optional[str] = None,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         """Build ``CREATE`` clauses to insert extracted entities/relationships.
+
+        Entity values are passed as ``$param`` placeholders to prevent
+        Cypher injection.
 
         Parameters
         ----------
@@ -364,8 +552,9 @@ class RelationToCypherConverter:
 
         Returns
         -------
-        str
-            Cypher query, or ``""`` when nothing was extracted.
+        tuple[str, dict]
+            ``(cypher_query, parameters)``.  Returns ``("", {})`` when
+            nothing was extracted.
         """
         return self._build_clause("CREATE", relations, return_clause)
 
@@ -378,10 +567,11 @@ class RelationToCypherConverter:
         keyword: str,
         relations: Dict[str, Any],
         return_clause: Optional[str],
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         rel_data: Dict[str, List[Any]] = relations.get("relation_extraction", {})
         clauses: List[str] = []
         return_vars: List[str] = []
+        params: Dict[str, Any] = {}
         np = self.name_property
         idx = 0
         seen: set = set()  # (subject, obj, cypher_rel) deduplication
@@ -402,23 +592,26 @@ class RelationToCypherConverter:
                     continue
                 seen.add(key)
                 a_var, b_var = f"a{idx}", f"b{idx}"
+                a_param, b_param = f"{a_var}_val", f"{b_var}_val"
+                params[a_param] = subject
+                params[b_param] = obj
                 clauses.append(
-                    f'{keyword} ({a_var}{src_l} {{{np}: "{subject}"}})'
+                    f'{keyword} ({a_var}{src_l} {{{np}: ${a_param}}})'
                     f"-[:{cypher_rel}]->"
-                    f'({b_var}{tgt_l} {{{np}: "{obj}"}})'
+                    f'({b_var}{tgt_l} {{{np}: ${b_param}}})'
                 )
                 return_vars.extend([a_var, b_var])
                 idx += 1
 
         if not clauses:
-            return ""
+            return "", {}
 
         ret = (
             return_clause
             if return_clause is not None
             else f"RETURN {', '.join(return_vars)}"
         )
-        return "\n".join(clauses) + f"\n{ret}"
+        return "\n".join(clauses) + f"\n{ret}", params
 
     # ------------------------------------------------------------------
     # Unified entry point
@@ -429,8 +622,8 @@ class RelationToCypherConverter:
         relations: Dict[str, Any],
         mode: str = "match",
         **kwargs: Any,
-    ) -> str:
-        """Convert extracted relations to a Cypher query.
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Convert extracted relations to a parameterized Cypher query.
 
         Parameters
         ----------
@@ -444,8 +637,11 @@ class RelationToCypherConverter:
 
         Returns
         -------
-        str
-            Cypher query string, or ``""`` if nothing was extracted.
+        tuple[str, dict]
+            ``(cypher_query, parameters)`` where *parameters* maps each
+            ``$placeholder`` to its entity-text value.  Pass both to
+            :meth:`Neo4jDatabase.execute`.  Returns ``("", {})`` when
+            nothing was extracted.
 
         Raises
         ------
@@ -829,7 +1025,7 @@ class NLToCypher:
         relations = self.extractor.extract_relations(
             text, relation_types, threshold=threshold
         )
-        cypher = self.converter.convert(relations, mode=mode, **kwargs)
+        cypher, params = self.converter.convert(relations, mode=mode, **kwargs)
 
         if execute:
             if self.db is None:
@@ -838,7 +1034,7 @@ class NLToCypher:
                     "Pass db=Neo4jDatabase(...) when constructing NLToCypher "
                     "or via NLToCypher.from_pretrained(..., db=db)."
                 )
-            results = self.db.execute(cypher) if cypher else []
+            results = self.db.execute(cypher, params) if cypher else []
             return cypher, results
 
         return cypher
@@ -887,7 +1083,7 @@ class NLToCypher:
         relations = self.extractor.extract_relations(
             text, relation_types, threshold=threshold
         )
-        cypher = self.converter.convert(relations, mode=mode, **kwargs)
+        cypher, params = self.converter.convert(relations, mode=mode, **kwargs)
 
         if execute:
             if self.db is None:
@@ -895,7 +1091,7 @@ class NLToCypher:
                     "execute=True requires a database connection. "
                     "Pass db=Neo4jDatabase(...) when constructing NLToCypher."
                 )
-            results = self.db.execute(cypher) if cypher else []
+            results = self.db.execute(cypher, params) if cypher else []
             return relations, cypher, results
 
         return relations, cypher
