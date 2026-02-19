@@ -70,14 +70,6 @@ maturin build --release
 pip install dist/cypher_validator-*.whl
 ```
 
-### Optional: GLiNER2 support
-
-```bash
-pip install gliner2
-# or, when installing the wheel:
-pip install "cypher_validator[gliner2]"
-```
-
 ---
 
 ## Quick start
@@ -401,12 +393,6 @@ info.properties_used
 ## GLiNER2 integration
 
 The GLiNER2 integration converts relation-extraction results into Cypher queries. It consists of three classes, each usable independently.
-
-Install the optional dependency first:
-
-```bash
-pip install gliner2
-```
 
 ### RelationToCypherConverter
 
