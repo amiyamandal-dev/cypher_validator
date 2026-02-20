@@ -192,6 +192,7 @@ fn build_updating_clause(pair: Pair<Rule>) -> Result<UpdatingClause, CypherError
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(UpdatingClause::Delete { detach, exprs })
         }
+        Rule::foreach_clause => build_foreach_clause(inner),
         _ => Err(CypherError::ParseError(format!("Unknown updating clause: {:?}", inner.as_rule()))),
     }
 }
@@ -439,10 +440,26 @@ fn build_pattern_part(pair: Pair<Rule>) -> Result<PatternPart, CypherError> {
 
 fn build_pattern_element(pair: Pair<Rule>) -> Result<PatternElement, CypherError> {
     let mut children = pair.into_inner();
-    let start = build_node_pattern(children.next().ok_or_else(|| CypherError::ParseError("Pattern element missing node".into()))?)?;
+    let first = children.next()
+        .ok_or_else(|| CypherError::ParseError("Pattern element missing node".into()))?;
+
+    // pattern_element may start with shortest_path_call; unwrap it to get the inner chain.
+    let (start, rest): (NodePattern, Box<dyn Iterator<Item = Pair<Rule>>>) =
+        if first.as_rule() == Rule::shortest_path_call {
+            let mut sp = first.into_inner();
+            let sp_start = build_node_pattern(
+                sp.next().ok_or_else(|| CypherError::ParseError("shortestPath missing node".into()))?,
+            )?;
+            // chain from inside shortest_path_call, then nothing left in outer children
+            (sp_start, Box::new(sp))
+        } else {
+            // Regular path: first child is node_pattern, rest is the outer iterator
+            (build_node_pattern(first)?, Box::new(children))
+        };
+
     let mut chain = vec![];
     let mut rel_opt: Option<RelationshipPattern> = None;
-    for child in children {
+    for child in rest {
         match child.as_rule() {
             Rule::relationship_pattern => rel_opt = Some(build_relationship_pattern(child)?),
             Rule::node_pattern => {
@@ -756,6 +773,8 @@ fn build_postfix_expr(pair: Pair<Rule>) -> Result<Expr, CypherError> {
 fn build_atom(pair: Pair<Rule>) -> Result<Expr, CypherError> {
     let inner = pair.into_inner().next().ok_or_else(|| CypherError::ParseError("Empty atom".into()))?;
     match inner.as_rule() {
+        Rule::reduce_expression => build_reduce_expression(inner),
+        Rule::shortest_path_call => build_shortest_path_expr(inner),
         Rule::literal => build_literal(inner),
         Rule::parameter => Ok(Expr::Parameter(inner.as_str().trim_start_matches('$').to_string())),
         Rule::case_expression => build_case_expression(inner),
@@ -911,6 +930,98 @@ fn build_exists_subquery(pair: Pair<Rule>) -> Result<Expr, CypherError> {
         Rule::pattern => Ok(Expr::Exists(Box::new(ExistsSubquery::Pattern(build_pattern(inner)?)))),
         _ => Err(CypherError::ParseError("Unknown EXISTS subquery type".into())),
     }
+}
+
+/// Build an `Expr::ShortestPath` from a `shortest_path_call` pair.
+/// The pair's children are: node_pattern, (relationship_pattern node_pattern)*.
+fn build_shortest_path_expr(pair: Pair<Rule>) -> Result<Expr, CypherError> {
+    let text = pair.as_str();
+    let all = text.len() >= 3 && text[..3].eq_ignore_ascii_case("all");
+    let mut children = pair.into_inner();
+    let start = build_node_pattern(
+        children.next().ok_or_else(|| CypherError::ParseError("shortestPath missing start node".into()))?,
+    )?;
+    let mut chain = vec![];
+    let mut rel_opt: Option<RelationshipPattern> = None;
+    for child in children {
+        match child.as_rule() {
+            Rule::relationship_pattern => rel_opt = Some(build_relationship_pattern(child)?),
+            Rule::node_pattern => {
+                if let Some(rel) = rel_opt.take() {
+                    chain.push((rel, build_node_pattern(child)?));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Expr::ShortestPath {
+        all,
+        element: Box::new(PatternElement { start, chain }),
+    })
+}
+
+fn build_foreach_clause(pair: Pair<Rule>) -> Result<UpdatingClause, CypherError> {
+    // Children (silent tokens stripped): variable, expression, (updating_clause)+
+    let mut children = pair.into_inner();
+    let variable = children
+        .next()
+        .ok_or_else(|| CypherError::ParseError("FOREACH missing variable".into()))?
+        .as_str()
+        .to_string();
+    let list_expr = build_expression(
+        children
+            .next()
+            .ok_or_else(|| CypherError::ParseError("FOREACH missing list expression".into()))?,
+    )?;
+    let mut body = vec![];
+    for child in children {
+        if child.as_rule() == Rule::updating_clause {
+            body.push(build_updating_clause(child)?);
+        }
+    }
+    if body.is_empty() {
+        return Err(CypherError::ParseError("FOREACH body is empty".into()));
+    }
+    Ok(UpdatingClause::Foreach { variable, list_expr, body })
+}
+
+fn build_reduce_expression(pair: Pair<Rule>) -> Result<Expr, CypherError> {
+    // Children (in order, silent tokens filtered by pest):
+    //   variable (accumulator), expression (init),
+    //   variable (loop var), expression (source), expression (projection)
+    let mut children = pair.into_inner();
+    let accumulator = children
+        .next()
+        .ok_or_else(|| CypherError::ParseError("REDUCE missing accumulator".into()))?
+        .as_str()
+        .to_string();
+    let init = build_expression(
+        children
+            .next()
+            .ok_or_else(|| CypherError::ParseError("REDUCE missing init expression".into()))?,
+    )?;
+    let variable = children
+        .next()
+        .ok_or_else(|| CypherError::ParseError("REDUCE missing loop variable".into()))?
+        .as_str()
+        .to_string();
+    let source = build_expression(
+        children
+            .next()
+            .ok_or_else(|| CypherError::ParseError("REDUCE missing source expression".into()))?,
+    )?;
+    let projection = build_expression(
+        children
+            .next()
+            .ok_or_else(|| CypherError::ParseError("REDUCE missing projection expression".into()))?,
+    )?;
+    Ok(Expr::Reduce {
+        accumulator,
+        init: Box::new(init),
+        variable,
+        source: Box::new(source),
+        projection: Box::new(projection),
+    })
 }
 
 fn build_function_invocation(pair: Pair<Rule>) -> Result<Expr, CypherError> {

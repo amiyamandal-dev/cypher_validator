@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::schema::Schema;
 use crate::parser::ast::*;
 
@@ -88,6 +88,7 @@ fn did_you_mean_rel(name: &str, candidates: &[String]) -> String {
 pub struct SemanticValidator<'a> {
     pub schema: &'a Schema,
     pub errors: Vec<String>,
+    pub warnings: Vec<String>,
     pub env: TypeEnv,
     /// Cached label list for "did you mean" suggestions — computed once per validation.
     known_labels: Vec<String>,
@@ -102,6 +103,7 @@ impl<'a> SemanticValidator<'a> {
         SemanticValidator {
             schema,
             errors: vec![],
+            warnings: vec![],
             env: HashMap::new(),
             known_labels,
             known_rel_types,
@@ -185,21 +187,15 @@ impl<'a> SemanticValidator<'a> {
     // ===== WITH scope management =====
 
     fn process_with_clause(&mut self, with: &WithClause) {
-        // Validate WITH expressions against the current (pre-reset) env
+        // Validate WITH projection expressions against the current (pre-reset) env.
         for item in &with.items {
             self.validate_expr(&item.expr);
         }
-        if let Some(order) = &with.order {
-            for si in order { self.validate_expr(&si.expr); }
-        }
-        if let Some(s) = &with.skip { self.validate_expr(s); }
-        if let Some(l) = &with.limit { self.validate_expr(l); }
-        // WHERE is also evaluated against the old env (pre-WITH scope)
-        if let Some(where_expr) = &with.where_clause {
-            self.validate_expr(where_expr);
-        }
+        self.check_alias_uniqueness(&with.items);
 
-        // Reset env: only projected variables survive the WITH boundary
+        // Reset env: only projected variables survive the WITH boundary.
+        // In Cypher, ORDER BY and WHERE after WITH are evaluated in the *projected* scope,
+        // so aliases introduced by the WITH projection are visible in both.
         let mut new_env: TypeEnv = HashMap::new();
         for item in &with.items {
             let name = item.alias.clone().or_else(|| {
@@ -216,6 +212,16 @@ impl<'a> SemanticValidator<'a> {
             }
         }
         self.env = new_env;
+
+        // ORDER BY, SKIP, LIMIT, and WHERE are evaluated in the projected scope
+        if let Some(order) = &with.order {
+            for si in order { self.validate_expr(&si.expr); }
+        }
+        if let Some(s) = &with.skip { self.validate_pagination_expr(s, "SKIP"); }
+        if let Some(l) = &with.limit { self.validate_pagination_expr(l, "LIMIT"); }
+        if let Some(where_expr) = &with.where_clause {
+            self.validate_expr(where_expr);
+        }
     }
 
     // ===== Binding collection =====
@@ -242,6 +248,7 @@ impl<'a> SemanticValidator<'a> {
                 let pattern = Pattern { parts: vec![m.pattern_part.clone()] };
                 self.collect_pattern_bindings(&pattern);
             }
+            // FOREACH variable is locally scoped; not projected into outer env
             _ => {}
         }
     }
@@ -297,11 +304,174 @@ impl<'a> SemanticValidator<'a> {
             ReadingClause::Match(m) => {
                 self.validate_pattern(&m.pattern);
                 if let Some(w) = &m.where_clause {
-                    self.validate_expr(w);
+                    self.validate_expr_no_aggregate(w, "MATCH WHERE");
                 }
+                self.check_cartesian_product(m);
+                self.check_match_complexity(m);
             }
             ReadingClause::Unwind(u) => self.validate_expr(&u.expr),
             ReadingClause::Call(_) => {}
+        }
+    }
+
+    /// Collect all variable names introduced by a single pattern part.
+    fn pattern_part_vars(part: &PatternPart) -> HashSet<String> {
+        let mut vars: HashSet<String> = HashSet::new();
+        if let Some(v) = &part.variable {
+            vars.insert(v.clone());
+        }
+        let elem = &part.element;
+        if let Some(v) = &elem.start.variable {
+            vars.insert(v.clone());
+        }
+        for (rel, node) in &elem.chain {
+            if let Some(v) = &rel.variable {
+                vars.insert(v.clone());
+            }
+            if let Some(v) = &node.variable {
+                vars.insert(v.clone());
+            }
+        }
+        vars
+    }
+
+    /// Gap 2: warn when a MATCH has disconnected pattern parts (Cartesian product).
+    ///
+    /// Checks structural connectivity of the pattern parts: two parts are connected if they
+    /// share at least one variable.  Because binding collection runs before validation,
+    /// `self.env` already contains every variable in the current clause — so we work purely
+    /// on the pattern structure rather than using `self.env` as a "bound before" proxy.
+    fn check_cartesian_product(&mut self, m: &MatchClause) {
+        if m.pattern.parts.len() < 2 {
+            return;
+        }
+        let mut connected: HashSet<String> = HashSet::new();
+        let mut has_first = false;
+        for part in &m.pattern.parts {
+            let vars = Self::pattern_part_vars(part);
+            if !has_first {
+                connected.extend(vars);
+                has_first = true;
+            } else if vars.is_disjoint(&connected) {
+                // This part shares no variable with any previously seen part → Cartesian
+                self.warnings.push(
+                    "MATCH pattern contains disconnected parts that will produce a Cartesian \
+                     product; add a relationship or shared variable to connect them"
+                        .to_string(),
+                );
+                break; // one warning per MATCH clause is enough
+            } else {
+                connected.extend(vars);
+            }
+        }
+    }
+
+    // ===== Aggregate-context helpers =====
+
+    /// Returns true if `expr` (anywhere in its subtree) contains an aggregate function call
+    /// or COUNT(*), which are only valid in RETURN / WITH / ORDER BY projection context.
+    fn contains_aggregate(expr: &Expr) -> bool {
+        const AGGREGATES: &[&str] = &[
+            "count", "collect", "sum", "avg", "min", "max",
+            "stdev", "stdevp", "percentilecont", "percentiledisc",
+        ];
+        match expr {
+            Expr::CountStar => true,
+            Expr::FunctionCall { name, args, .. } => {
+                AGGREGATES.contains(&name.to_lowercase().as_str())
+                    || args.iter().any(Self::contains_aggregate)
+            }
+            Expr::Or(a, b) | Expr::Xor(a, b) | Expr::And(a, b)
+            | Expr::Eq(a, b) | Expr::Ne(a, b) | Expr::Lt(a, b) | Expr::Lte(a, b)
+            | Expr::Gt(a, b) | Expr::Gte(a, b) | Expr::Regex(a, b)
+            | Expr::In(a, b) | Expr::StartsWith(a, b) | Expr::EndsWith(a, b)
+            | Expr::Contains(a, b)
+            | Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b)
+            | Expr::Div(a, b) | Expr::Mod(a, b) | Expr::Pow(a, b) => {
+                Self::contains_aggregate(a) || Self::contains_aggregate(b)
+            }
+            Expr::Not(e) | Expr::Neg(e) | Expr::IsNull(e) | Expr::IsNotNull(e) => {
+                Self::contains_aggregate(e)
+            }
+            Expr::Property { expr: e, .. } => Self::contains_aggregate(e),
+            Expr::Subscript { expr: e, index } => {
+                Self::contains_aggregate(e) || Self::contains_aggregate(index)
+            }
+            Expr::List(items) => items.iter().any(Self::contains_aggregate),
+            Expr::Map(map) => map.values().any(Self::contains_aggregate),
+            Expr::Case { subject, alternatives, default } => {
+                subject.as_ref().map_or(false, |s| Self::contains_aggregate(s))
+                    || alternatives.iter().any(|(w, t)| {
+                        Self::contains_aggregate(w) || Self::contains_aggregate(t)
+                    })
+                    || default.as_ref().map_or(false, |d| Self::contains_aggregate(d))
+            }
+            _ => false,
+        }
+    }
+
+    /// Validate `expr` and error if it contains an aggregate function in a context that
+    /// does not support aggregation (e.g. MATCH WHERE, SET, DELETE).
+    fn validate_expr_no_aggregate(&mut self, expr: &Expr, context: &str) {
+        if Self::contains_aggregate(expr) {
+            self.errors.push(format!(
+                "Aggregate function not allowed in {} context; \
+                 aggregates are only valid in RETURN, WITH, or ORDER BY",
+                context
+            ));
+        }
+        self.validate_expr(expr);
+    }
+
+    /// Validate a SKIP/LIMIT expression: must be an integer, parameter, or variable —
+    /// not a string, boolean, null, or float.
+    fn validate_pagination_expr(&mut self, expr: &Expr, context: &str) {
+        match expr {
+            Expr::Str(_) => self.errors.push(format!(
+                "{} expression must be an integer, got a string literal", context
+            )),
+            Expr::Bool(_) => self.errors.push(format!(
+                "{} expression must be an integer, got a boolean literal", context
+            )),
+            Expr::Null => self.errors.push(format!(
+                "{} expression must be an integer, got NULL", context
+            )),
+            Expr::Float(_) => self.errors.push(format!(
+                "{} expression must be an integer, got a float literal", context
+            )),
+            _ => self.validate_expr(expr),
+        }
+    }
+
+    /// Gap 5: warn about unlabeled full-graph scans and unbounded variable-length relationships.
+    fn check_match_complexity(&mut self, m: &MatchClause) {
+        // A: unlabeled node with no WHERE clause
+        if m.where_clause.is_none()
+            && m.pattern.parts.iter().any(|part| {
+                part.element.start.labels.is_empty()
+                    || part.element.chain.iter().any(|(_, n)| n.labels.is_empty())
+            })
+        {
+            self.warnings.push(
+                "MATCH contains an unlabeled node with no WHERE clause; \
+                 this will scan all nodes in the graph"
+                    .to_string(),
+            );
+        }
+
+        // B: unbounded variable-length relationship
+        for part in &m.pattern.parts {
+            for (rel, _) in &part.element.chain {
+                if let Some(r) = &rel.range {
+                    if r.max.is_none() {
+                        self.warnings.push(
+                            "Variable-length relationship without an upper bound ([*] or [*n..]) \
+                             may cause unbounded traversal"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -319,7 +489,17 @@ impl<'a> SemanticValidator<'a> {
                 for item in items { self.validate_remove_item(item); }
             }
             UpdatingClause::Delete { exprs, .. } => {
-                for e in exprs { self.validate_expr(e); }
+                for e in exprs {
+                    self.validate_expr_no_aggregate(e, "DELETE");
+                }
+            }
+            UpdatingClause::Foreach { variable, list_expr, body } => {
+                self.validate_expr(list_expr);
+                // variable is locally scoped to the FOREACH body
+                let was_bound = self.env.contains_key(variable.as_str());
+                if !was_bound { self.env.insert(variable.clone(), vec![]); }
+                for clause in body { self.validate_updating_clause(clause); }
+                if !was_bound { self.env.remove(variable.as_str()); }
             }
         }
     }
@@ -328,14 +508,31 @@ impl<'a> SemanticValidator<'a> {
         match &ret.items {
             ReturnItems::Items(items) => {
                 for item in items { self.validate_expr(&item.expr); }
+                self.check_alias_uniqueness(items);
             }
             ReturnItems::Wildcard => {}
         }
         if let Some(order) = &ret.order {
             for si in order { self.validate_expr(&si.expr); }
         }
-        if let Some(s) = &ret.skip { self.validate_expr(s); }
-        if let Some(l) = &ret.limit { self.validate_expr(l); }
+        if let Some(s) = &ret.skip { self.validate_pagination_expr(s, "SKIP"); }
+        if let Some(l) = &ret.limit { self.validate_pagination_expr(l, "LIMIT"); }
+    }
+
+    fn check_alias_uniqueness(&mut self, items: &[ReturnItem]) {
+        let mut seen: HashSet<String> = HashSet::new();
+        for item in items {
+            let name = item.alias.clone().or_else(|| {
+                if let Expr::Variable(v) = &item.expr { Some(v.clone()) } else { None }
+            });
+            if let Some(n) = name {
+                if !seen.insert(n.clone()) {
+                    self.errors.push(format!(
+                        "Duplicate projection name '{}' in RETURN/WITH", n
+                    ));
+                }
+            }
+        }
     }
 
     // ===== Pattern validation (direction + endpoint aware) =====
@@ -455,10 +652,10 @@ impl<'a> SemanticValidator<'a> {
         match item {
             SetItem::PropertySet { prop, value } => {
                 self.validate_property_access(&prop.variable, &prop.properties);
-                self.validate_expr(value);
+                self.validate_expr_no_aggregate(value, "SET");
             }
-            SetItem::VariableSet { value, .. } => self.validate_expr(value),
-            SetItem::VariableAdd { value, .. } => self.validate_expr(value),
+            SetItem::VariableSet { value, .. } => self.validate_expr_no_aggregate(value, "SET"),
+            SetItem::VariableAdd { value, .. } => self.validate_expr_no_aggregate(value, "SET"),
             SetItem::LabelSet { var: _, labels } => {
                 for label in labels {
                     if !self.schema.has_node_label(label) {
@@ -547,7 +744,21 @@ impl<'a> SemanticValidator<'a> {
             }
 
             // ===== Function calls =====
-            Expr::FunctionCall { args, .. } => {
+            Expr::FunctionCall { name, args, .. } => {
+                const NUMERIC_AGGREGATES: &[&str] = &[
+                    "sum", "avg", "stdev", "stdevp", "percentilecont", "percentiledisc",
+                ];
+                let norm = name.to_lowercase();
+                if NUMERIC_AGGREGATES.contains(&norm.as_str()) {
+                    for arg in args {
+                        if let Expr::Str(_) = arg {
+                            self.errors.push(format!(
+                                "Aggregate function {}() received a string literal; expected a numeric expression",
+                                name
+                            ));
+                        }
+                    }
+                }
                 for a in args { self.validate_expr(a); }
             }
 
@@ -600,6 +811,30 @@ impl<'a> SemanticValidator<'a> {
                 if !was_present { self.env.insert(variable.clone(), vec![]); }
                 if let Some(f) = filter { self.validate_expr(f); }
                 if !was_present { self.env.remove(variable.as_str()); }
+            }
+
+            // ===== shortestPath / allShortestPaths =====
+            Expr::ShortestPath { element, .. } => {
+                self.validate_node_pattern(&element.start);
+                let mut prev = &element.start;
+                for (rel, node) in &element.chain {
+                    self.validate_rel_pattern_with_endpoints(rel, prev, node);
+                    self.validate_node_pattern(node);
+                    prev = node;
+                }
+            }
+
+            // ===== REDUCE expression (locally-scoped variables) =====
+            Expr::Reduce { accumulator, init, variable, source, projection } => {
+                self.validate_expr(init);
+                self.validate_expr(source);
+                let acc_was = self.env.contains_key(accumulator.as_str());
+                let var_was = self.env.contains_key(variable.as_str());
+                if !acc_was { self.env.insert(accumulator.clone(), vec![]); }
+                if !var_was { self.env.insert(variable.clone(), vec![]); }
+                self.validate_expr(projection);
+                if !acc_was { self.env.remove(accumulator.as_str()); }
+                if !var_was { self.env.remove(variable.as_str()); }
             }
 
             // ===== Leaf nodes — no further validation =====

@@ -14,6 +14,8 @@ pub struct ValidationResult {
     pub syntax_errors: Vec<String>,
     /// Schema-level semantic errors only.
     pub semantic_errors: Vec<String>,
+    /// Advisory warnings (not errors — query still runs, but may be slow or wrong).
+    pub warnings: Vec<String>,
 }
 
 pub struct CypherValidator {
@@ -35,6 +37,7 @@ impl CypherValidator {
                     errors: vec![msg.clone()],
                     syntax_errors: vec![msg],
                     semantic_errors: vec![],
+                    warnings: vec![],
                 };
             }
             Err(e) => {
@@ -44,6 +47,7 @@ impl CypherValidator {
                     errors: vec![msg.clone()],
                     syntax_errors: vec![msg],
                     semantic_errors: vec![],
+                    warnings: vec![],
                 };
             }
         };
@@ -52,9 +56,10 @@ impl CypherValidator {
         let mut sem = SemanticValidator::new(&self.schema);
         sem.validate_query(&ast);
 
+        let warnings = sem.warnings;
         let semantic_errors = sem.errors;
         let errors = semantic_errors.clone();
         let is_valid = errors.is_empty();
-        ValidationResult { is_valid, errors, syntax_errors: vec![], semantic_errors }
+        ValidationResult { is_valid, errors, syntax_errors: vec![], semantic_errors, warnings }
     }
 }

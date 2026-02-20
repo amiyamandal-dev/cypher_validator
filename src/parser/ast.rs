@@ -78,6 +78,7 @@ pub enum UpdatingClause {
     Set(Vec<SetItem>),
     Remove(Vec<RemoveItem>),
     Delete { detach: bool, exprs: Vec<Expr> },
+    Foreach { variable: String, list_expr: Expr, body: Vec<UpdatingClause> },
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +272,21 @@ pub enum Expr {
     Any { variable: String, source: Box<Expr>, filter: Option<Box<Expr>> },
     None { variable: String, source: Box<Expr>, filter: Option<Box<Expr>> },
     Single { variable: String, source: Box<Expr>, filter: Option<Box<Expr>> },
+
+    // Reduce expression
+    Reduce {
+        accumulator: String,
+        init: Box<Expr>,
+        variable: String,
+        source: Box<Expr>,
+        projection: Box<Expr>,
+    },
+
+    // shortestPath / allShortestPaths
+    ShortestPath {
+        all: bool,
+        element: Box<PatternElement>,
+    },
 
     // Exists subquery
     Exists(Box<ExistsSubquery>),

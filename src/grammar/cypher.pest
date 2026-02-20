@@ -51,9 +51,14 @@ procedure_result_field = @{ identifier }
 updating_clause = {
     create_clause
   | merge_clause
+  | foreach_clause
   | set_clause
   | remove_clause
   | delete_clause
+}
+
+foreach_clause = {
+    ^"FOREACH" ~ "(" ~ variable ~ ^"IN" ~ expression ~ "|" ~ (updating_clause)+ ~ ")"
 }
 
 create_clause  = { ^"CREATE" ~ pattern }
@@ -102,7 +107,10 @@ where_clause   = { ^"WHERE" ~ expression }
 // ===== Patterns =====
 pattern        = { pattern_part ~ ("," ~ pattern_part)* }
 pattern_part   = { (variable ~ "=")? ~ pattern_element }
-pattern_element = { node_pattern ~ (relationship_pattern ~ node_pattern)* }
+pattern_element = {
+    shortest_path_call
+  | node_pattern ~ (relationship_pattern ~ node_pattern)*
+}
 
 node_pattern   = { "(" ~ variable? ~ node_labels? ~ properties? ~ ")" }
 node_labels    = { (":" ~ label_name)+ }
@@ -185,7 +193,9 @@ list_slice_op   = { "[" ~ expression? ~ ".." ~ expression? ~ "]" }
 
 // ===== Atoms =====
 atom = {
-    literal
+    reduce_expression
+  | shortest_path_call
+  | literal
   | parameter
   | case_expression
   | list_comprehension
@@ -208,6 +218,20 @@ function_invocation = {
 // Function names can be keywords (COUNT, COLLECT, EXISTS, etc.) or identifiers
 function_name = @{ namespace? ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 namespace     = @{ (identifier ~ ".")+ }
+
+reduce_expression = {
+    ^"REDUCE" ~ "(" ~ variable ~ "=" ~ expression ~ ","
+    ~ variable ~ ^"IN" ~ expression ~ "|" ~ expression ~ ")"
+}
+
+// shortestPath / allShortestPaths: usable both as an expression (RETURN shortestPath(...))
+// and as a pattern element (MATCH p = shortestPath(...)).
+// The inner chain is spelled out directly to avoid circular grammar with pattern_element.
+shortest_path_call = {
+    (^"allShortestPaths" | ^"shortestPath") ~ "("
+    ~ node_pattern ~ (relationship_pattern ~ node_pattern)*
+    ~ ")"
+}
 
 case_expression = {
     ^"CASE" ~ expression? ~
@@ -278,9 +302,9 @@ keyword = {
     | ^"BY" | ^"CALL" | ^"CASE" | ^"CONTAINS" | ^"COUNT"
     | ^"CREATE" | ^"DELETE" | ^"DESC" | ^"DESCENDING" | ^"DETACH"
     | ^"DISTINCT" | ^"DO" | ^"DROP" | ^"ELSE" | ^"END" | ^"ENDS"
-    | ^"EXISTS" | ^"FALSE" | ^"FOR" | ^"FROM" | ^"IN" | ^"IS"
+    | ^"EXISTS" | ^"FALSE" | ^"FOREACH" | ^"FOR" | ^"FROM" | ^"IN" | ^"IS"
     | ^"LIMIT" | ^"MATCH" | ^"MERGE" | ^"NEW" | ^"NONE" | ^"NOT"
-    | ^"NULL" | ^"ON" | ^"OPTIONAL" | ^"OR" | ^"ORDER" | ^"REMOVE"
+    | ^"NULL" | ^"ON" | ^"OPTIONAL" | ^"OR" | ^"ORDER" | ^"REDUCE" | ^"REMOVE"
     | ^"RETURN" | ^"SET" | ^"SINGLE" | ^"SKIP" | ^"STARTS" | ^"THEN"
     | ^"TRUE" | ^"UNION" | ^"UNWIND" | ^"WHEN" | ^"WHERE" | ^"WITH"
     | ^"XOR" | ^"YIELD") ~
