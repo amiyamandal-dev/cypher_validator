@@ -19,6 +19,8 @@ The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.r
   - [parse\_query / QueryInfo](#parse_query--queryinfo)
 - [GLiNER2 integration](#gliner2-integration)
   - [**NLToCypher** ← start here](#nltocypher)
+  - [DB-aware query generation](#db-aware-query-generation)
+  - [EntityNERExtractor](#entitynerextractor)
   - [GLiNER2RelationExtractor](#gliner2relationextractor)
   - [RelationToCypherConverter](#relationtocypherconverter)
   - [Neo4jDatabase](#neo4jdatabase)
@@ -35,6 +37,7 @@ The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.r
 - [Performance](#performance)
 - [Type stubs and IDE support](#type-stubs-and-ide-support)
 - [Project structure](#project-structure)
+- [Examples](#examples)
 - [Development](#development)
 
 ---
@@ -51,6 +54,8 @@ The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.r
 | **Schema-free parsing** | Extracts labels, relationship types, and property keys from any query without requiring a schema |
 | **Schema serialization** | `Schema.to_dict()`, `from_dict()`, `to_json()`, `from_json()`, and `merge()` for complete schema lifecycle management |
 | **NL → Cypher** | Converts GLiNER2 relation-extraction output to MATCH / MERGE / CREATE queries with automatic deduplication |
+| **DB-aware generation** | `db_aware=True` looks up every extracted entity in Neo4j before query generation — existing nodes are MATCHed, new ones are CREATEd inline, preventing duplicate nodes |
+| **NER entity extraction** | `EntityNERExtractor` wraps spaCy or any HuggingFace Transformers NER pipeline to enrich entity-label resolution during DB-aware generation |
 | **Zero-shot RE** | Wraps the `gliner2` model for natural-language relation extraction (optional) |
 | **LLM schema context** | `to_prompt()`, `to_markdown()`, `to_cypher_context()` format the schema for LLM system prompts |
 | **Cypher extraction** | `extract_cypher_from_text()` pulls Cypher out of any LLM response (fenced blocks, inline, plain text) |
@@ -85,6 +90,23 @@ maturin develop
 # Or build an optimised release wheel
 maturin build --release
 pip install dist/cypher_validator-*.whl
+```
+
+### Optional dependencies
+
+```bash
+# Neo4j driver (required for execute=True and db_aware=True)
+pip install "cypher_validator[neo4j]"
+
+# NER with spaCy (EntityNERExtractor.from_spacy)
+pip install "cypher_validator[ner-spacy]"
+python -m spacy download en_core_web_sm   # or en_core_web_trf for transformer accuracy
+
+# NER with HuggingFace Transformers (EntityNERExtractor.from_transformers)
+pip install "cypher_validator[ner-transformers]"
+
+# Everything at once
+pip install "cypher_validator[neo4j,ner]"
 ```
 
 ---
@@ -590,6 +612,302 @@ results = {
 | `mode` | `"match"` | `"match"`, `"merge"`, or `"create"` |
 | `return_clause` | auto | Custom `RETURN …` tail (e.g. `"RETURN *"`) |
 
+**`to_db_aware_query()` — advanced low-level use:**
+
+If you want to generate a MATCH/CREATE query without going through `NLToCypher`, you can call `to_db_aware_query()` directly after building the entity status dict yourself:
+
+```python
+converter = RelationToCypherConverter(schema=schema)
+
+# entity_status maps each entity name to its DB lookup result
+entity_status = {
+    "John":       {"var": "e0", "label": "Person",  "param_key": "e0_val",
+                   "found": True,  "introduced": False},  # exists in DB
+    "Apple Inc.": {"var": "e1", "label": "Company", "param_key": "e1_val",
+                   "found": False, "introduced": False},  # new
+}
+
+relations = {"relation_extraction": {"works_for": [("John", "Apple Inc.")]}}
+cypher, params = converter.to_db_aware_query(relations, entity_status)
+# MATCH (e0:Person {name: $e0_val})
+# CREATE (e0)-[:WORKS_FOR]->(e1:Company {name: $e1_val})
+# RETURN e0, e1
+```
+
+`NLToCypher._collect_entity_status()` builds this dict automatically from a live DB when `db_aware=True` is used — the low-level API is exposed for cases where you control the lookup yourself.
+
+---
+
+### DB-aware query generation
+
+> **`db_aware=True`** is the flag that makes `NLToCypher` graph-state-aware.
+> Without it, every call blindly CREATEs all entities, producing **duplicate nodes** for entities that already exist in the database.
+> With it, each entity is looked up first and either MATCHed (existing) or CREATEd (new).
+
+#### How it works
+
+When `db_aware=True` is passed to `__call__()` or `extract_and_convert()`:
+
+1. Relations are extracted from the text (same as normal).
+2. Each unique entity is identified and its label is resolved from the schema (and optionally enriched by a `EntityNERExtractor`).
+3. A `MATCH (n:Label {name: $val}) RETURN elementId(n) LIMIT 1` query is sent to Neo4j for each entity.
+4. A mixed query is generated:
+   - **Existing entities** → `MATCH (eN:Label {name: $eN_val})` at the top.
+   - **New entities** → `CREATE (eN:Label {name: $eN_val})` inline on first use; subsequent relations reuse the bare variable `eN`.
+   - **Relationship edges** → always `CREATE (eA)-[:REL]->(eB)`.
+
+#### All four entity-existence combinations
+
+```python
+from cypher_validator import NLToCypher, Neo4jDatabase, Schema
+
+schema = Schema(
+    nodes={"Person": ["name"], "Company": ["name"]},
+    relationships={"WORKS_FOR": ("Person", "Company", [])},
+)
+db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+pipeline = NLToCypher.from_pretrained("fastino/gliner2-large-v1", schema=schema, db=db)
+```
+
+**Case 1 — neither entity exists:**
+
+```python
+cypher = pipeline("John works for Apple Inc.", ["works_for"], db_aware=True)
+# CREATE (e0:Person {name: $e0_val})-[:WORKS_FOR]->(e1:Company {name: $e1_val})
+# RETURN e0, e1
+```
+
+**Case 2 — subject (John) exists, object is new:**
+
+```python
+# (John was previously inserted into the DB)
+cypher = pipeline("John works for Apple Inc.", ["works_for"], db_aware=True)
+# MATCH (e0:Person {name: $e0_val})
+# CREATE (e0)-[:WORKS_FOR]->(e1:Company {name: $e1_val})
+# RETURN e0, e1
+```
+
+**Case 3 — object (Apple Inc.) exists, subject is new:**
+
+```python
+cypher = pipeline("John works for Apple Inc.", ["works_for"], db_aware=True)
+# MATCH (e1:Company {name: $e1_val})
+# CREATE (e0:Person {name: $e0_val})-[:WORKS_FOR]->(e1)
+# RETURN e1, e0
+```
+
+**Case 4 — both exist:**
+
+```python
+cypher = pipeline("John works for Apple Inc.", ["works_for"], db_aware=True)
+# MATCH (e0:Person {name: $e0_val})
+# MATCH (e1:Company {name: $e1_val})
+# CREATE (e0)-[:WORKS_FOR]->(e1)
+# RETURN e0, e1
+```
+
+#### Multiple relations — shared entity reuse
+
+The same entity variable is introduced once and reused across all relations, regardless of how many it participates in:
+
+```python
+schema = Schema(
+    nodes={"Person": ["name"], "Company": ["name"], "City": ["name"]},
+    relationships={
+        "WORKS_FOR": ("Person", "Company", []),
+        "LIVES_IN":  ("Person", "City", []),
+    },
+)
+pipeline = NLToCypher.from_pretrained(..., schema=schema, db=db)
+
+# John exists in DB; Apple Inc. and San Francisco are new
+cypher = pipeline(
+    "John works for Apple Inc. and lives in San Francisco.",
+    ["works_for", "lives_in"],
+    db_aware=True,
+)
+# MATCH (e0:Person {name: $e0_val})          ← John MATCHed once
+# CREATE (e0)-[:WORKS_FOR]->(e1:Company {name: $e1_val})   ← Apple created inline
+# CREATE (e0)-[:LIVES_IN]->(e2:City {name: $e2_val})       ← SF created inline, e0 reused
+# RETURN e0, e1, e2
+```
+
+When all three exist:
+
+```python
+# MATCH (e0:Person {name: $e0_val})
+# MATCH (e1:Company {name: $e1_val})
+# MATCH (e2:City {name: $e2_val})
+# CREATE (e0)-[:WORKS_FOR]->(e1)   ← only edges are created
+# CREATE (e0)-[:LIVES_IN]->(e2)
+# RETURN e0, e1, e2
+```
+
+#### Combine `db_aware` with `execute`
+
+```python
+# Look up entities, generate query, AND execute it — all in one call
+cypher, records = pipeline(
+    "John works for Apple Inc.",
+    ["works_for"],
+    db_aware=True,
+    execute=True,
+)
+# cypher  → mixed MATCH/CREATE string
+# records → [{"e0": <Node John>, "e1": <Node Apple Inc.>}]
+```
+
+#### Why this matters vs. plain `execute=True`
+
+```python
+# ── Without db_aware (legacy) ─────────────────────────────────────────────
+# John is already in the DB — this creates a second John node:
+cypher, _ = pipeline("John works for Apple Inc.", ["works_for"],
+                     mode="create", execute=True)
+# CREATE (a0:Person {name: $a0_val})-[:WORKS_FOR]->(b0:Company {name: $b0_val})
+# → John now appears TWICE in the database ✗
+
+# ── With db_aware ─────────────────────────────────────────────────────────
+cypher, _ = pipeline("John works for Apple Inc.", ["works_for"],
+                     db_aware=True, execute=True)
+# MATCH (e0:Person {name: $e0_val})
+# CREATE (e0)-[:WORKS_FOR]->(e1:Company {name: $e1_val})
+# → John reused, no duplicate ✓
+```
+
+---
+
+### EntityNERExtractor
+
+An optional NER wrapper that enriches entity-label resolution during DB-aware query generation. Useful when the schema is absent, incomplete, or when you want finer-grained entity typing (e.g. distinguishing `Person` from `Organization` for entities that appear as arguments of an unknown relation type).
+
+Supports two backends — **spaCy** (fast, CPU-friendly) and **HuggingFace Transformers** (higher accuracy, GPU-optional):
+
+```python
+from cypher_validator import EntityNERExtractor
+```
+
+#### spaCy backend
+
+```python
+# pip install "cypher_validator[ner-spacy]"
+# python -m spacy download en_core_web_sm
+
+ner = EntityNERExtractor.from_spacy("en_core_web_sm")
+ner.extract("John works for Apple Inc. and lives in San Francisco.")
+# [
+#   {"text": "John",          "label": "Person"},
+#   {"text": "Apple Inc.",    "label": "Organization"},
+#   {"text": "San Francisco", "label": "Location"},
+# ]
+```
+
+Built-in spaCy label → graph node-label mappings:
+
+| spaCy type | Graph label |
+|---|---|
+| `PERSON` | `Person` |
+| `ORG` | `Organization` |
+| `GPE` | `Location` |
+| `LOC` | `Location` |
+| `FAC` | `Facility` |
+| `PRODUCT` | `Product` |
+| `EVENT` | `Event` |
+| `NORP` | `Group` |
+| *(unknown)* | *type capitalised as-is* |
+
+Override or extend with `label_map`:
+
+```python
+ner = EntityNERExtractor.from_spacy(
+    "en_core_web_trf",
+    label_map={"ORG": "Company", "GPE": "City"},   # override defaults
+)
+```
+
+#### HuggingFace Transformers backend
+
+```python
+# pip install "cypher_validator[ner-transformers]"
+
+# General English NER (default model)
+ner = EntityNERExtractor.from_transformers(
+    "dbmdz/bert-large-cased-finetuned-conll03-english"
+)
+
+# High-accuracy general NER
+ner = EntityNERExtractor.from_transformers("Jean-Baptiste/roberta-large-ner-english")
+
+# Biomedical NER — fine-tuned model (recommended for medical/scientific graphs)
+ner = EntityNERExtractor.from_transformers(
+    "d4data/biomedical-ner-all",
+    label_map={
+        "Medication":           "Drug",
+        "Disease_disorder":     "Disease",
+        "Sign_symptom":         "Symptom",
+        "Biological_structure": "Anatomy",
+        "Diagnostic_procedure": "Procedure",
+    },
+    aggregation_strategy="first",   # avoids subword fragments with this model
+)
+
+ner.extract("John works for Apple Inc.")
+# [{"text": "John", "label": "Person"}, {"text": "Apple Inc.", "label": "Organization"}]
+```
+
+> **Note on `dmis-lab/biobert-v1.1`:** This is a *pre-trained language model*, not a fine-tuned NER classifier. When loaded as a token-classification pipeline it outputs generic `LABEL_0` / `LABEL_1` tags with no semantic meaning. Use it with a fully custom `label_map` (e.g. `{"LABEL_0": "BioEntity", "LABEL_1": "BioEntity"}`) if you only need candidate spans, or use a fine-tuned biomedical NER model such as `d4data/biomedical-ner-all` for semantic labels. See [examples/11_biobert_ner.py](examples/11_biobert_ner.py) for a detailed comparison.
+
+Built-in HuggingFace label → graph node-label mappings:
+
+| HF tag | Graph label |
+|---|---|
+| `PER` / `PERSON` | `Person` |
+| `ORG` | `Organization` |
+| `LOC` / `GPE` | `Location` |
+| `MISC` | `Entity` |
+| *(unknown)* | *tag capitalised as-is* |
+
+#### Plugging the NER extractor into `NLToCypher`
+
+When `ner_extractor` is supplied, its labels enrich or **override** schema-based label resolution for DB lookups. This is especially helpful when the schema doesn't cover all relation types:
+
+```python
+from cypher_validator import NLToCypher, EntityNERExtractor, Neo4jDatabase
+
+ner = EntityNERExtractor.from_spacy("en_core_web_sm")
+db  = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+
+pipeline = NLToCypher.from_pretrained(
+    "fastino/gliner2-large-v1",
+    schema=schema,
+    db=db,
+    ner_extractor=ner,    # ← plugged in here
+)
+
+cypher = pipeline(
+    "John works for Apple Inc.",
+    ["works_for"],
+    db_aware=True,
+)
+# NER identifies "John" as Person and "Apple Inc." as Organization
+# DB lookup uses those labels for the MATCH query
+# Generated Cypher uses the schema's "Company" label (schema wins when both provide a label)
+```
+
+**Label resolution priority (highest first):**
+
+1. NER extractor label (when `ner_extractor` is set and entity text matches)
+2. Schema endpoint label (derived from the relation type)
+3. Empty string (no label in pattern)
+
+**`EntityNERExtractor` API:**
+
+| Method | Description |
+|---|---|
+| `EntityNERExtractor.from_spacy(model_name, label_map=None)` | Load a spaCy `nlp` model |
+| `EntityNERExtractor.from_transformers(model_name, label_map=None, **kwargs)` | Load a HuggingFace NER pipeline |
+| `extractor.extract(text)` | Return `list[{"text": str, "label": str}]` |
+
 ---
 
 ### GLiNER2RelationExtractor
@@ -698,7 +1016,7 @@ cypher = pipeline(
 )
 ```
 
-**Database-aware execution (`execute=True`):**
+**Database execution (`execute=True`):**
 
 Pass a `Neo4jDatabase` to execute the generated query directly and receive both the Cypher string and the Neo4j records:
 
@@ -716,7 +1034,7 @@ cypher, records = pipeline(
     execute=True,
 )
 # cypher  → 'CREATE (a0:Person {name: $a0_val})-[:WORKS_FOR]->(b0:Company {name: $b0_val})\nRETURN a0, b0'
-# records → [{"a0": {...}, "b0": {...}}]  (Neo4j driver records as dicts)
+# records → [{"a0": {...}, "b0": {...}}]
 ```
 
 **Credentials from environment variables (`from_env`):**
@@ -728,15 +1046,9 @@ export NEO4J_PASSWORD=secret
 ```
 
 ```python
-# Reads NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD automatically
 pipeline = NLToCypher.from_env("fastino/gliner2-large-v1", schema=schema)
-
-cypher, records = pipeline(
-    "John works for Apple Inc.",
-    ["works_for"],
-    mode="create",
-    execute=True,
-)
+cypher, records = pipeline("John works for Apple Inc.", ["works_for"],
+                           mode="create", execute=True)
 ```
 
 **`from_pretrained()` / `from_env()` parameters:**
@@ -749,6 +1061,7 @@ cypher, records = pipeline(
 | `name_property` | `"name"` | Node property key for entity text |
 | `db` | `None` | `Neo4jDatabase` connection (`from_pretrained` only) |
 | `database` | `"neo4j"` | Neo4j database name (`from_env` only) |
+| `ner_extractor` | `None` | Optional `EntityNERExtractor` for enriched entity labels in DB-aware mode |
 
 **`__call__()` / `extract_and_convert()` parameters:**
 
@@ -756,9 +1069,10 @@ cypher, records = pipeline(
 |---|---|---|
 | `text` | required | Input sentence or passage |
 | `relation_types` | required | Relation labels to extract |
-| `mode` | `"match"` | Cypher generation mode (`"match"`, `"merge"`, `"create"`) |
+| `mode` | `"match"` | Cypher generation mode (`"match"`, `"merge"`, `"create"`). Ignored when `db_aware=True`. |
 | `threshold` | `None` | Override instance threshold |
 | `execute` | `False` | When `True`, run the query against the DB and return `(cypher, records)` |
+| `db_aware` | `False` | When `True`, look up each entity in the DB and generate MATCH/CREATE accordingly (see below) |
 | `return_clause` | auto | Custom `RETURN …` tail |
 
 ---
@@ -1052,11 +1366,17 @@ The highest-level interface: a complete Graph RAG loop in a single class.
 
 ```python
 from cypher_validator import GraphRAGPipeline, Neo4jDatabase, Schema
+import openai
+
+client = openai.OpenAI()   # reads OPENAI_API_KEY from environment
 
 def call_llm(prompt: str) -> str:
     """Wrap your LLM here — must accept a string and return a string."""
-    # e.g. via the Anthropic or OpenAI SDK
-    ...
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content
 
 schema = Schema(
     nodes={"Person": ["name"], "Company": ["name"]},
@@ -1294,13 +1614,15 @@ cypher_validator/
 │       ├── __init__.py               # Re-exports Rust core + GLiNER2 + LLM helpers
 │       ├── __init__.pyi              # Package-level type stubs (all classes and functions)
 │       ├── _cypher_validator.pyi     # Rust extension type stubs
-│       ├── gliner2_integration.py   # RelationToCypherConverter, GLiNER2RelationExtractor,
-│       │                             #   NLToCypher, Neo4jDatabase (incl. introspect_schema)
+│       ├── gliner2_integration.py   # EntityNERExtractor, GLiNER2RelationExtractor,
+│       │                             #   RelationToCypherConverter (incl. to_db_aware_query),
+│       │                             #   NLToCypher (incl. db_aware, _collect_entity_status),
+│       │                             #   Neo4jDatabase (incl. introspect_schema)
 │       ├── llm_utils.py              # extract_cypher_from_text, format_records,
 │       │                             #   repair_cypher, cypher_tool_spec, few_shot_examples
 │       └── rag.py                    # GraphRAGPipeline
 │
-└── tests/                            # 356 tests total
+└── tests/                            # 395 tests total
     ├── test_syntax.py                # PEG grammar / syntax tests
     ├── test_schema.py                # Schema API tests
     ├── test_validator.py             # Validator smoke tests
@@ -1309,11 +1631,41 @@ cypher_validator/
     ├── test_roundtrip.py             # Generator output validated by validator
     ├── test_gliner2_integration.py   # GLiNER2 integration tests (no ML required)
     ├── test_neo4j_integration.py     # Neo4jDatabase and NLToCypher execute=True tests
+    ├── test_db_aware.py              # db_aware=True, EntityNERExtractor, _collect_entity_status,
+    │                                 #   to_db_aware_query — all entity-existence combinations
     ├── test_task2_features.py        # AND/OR grammar fix, Schema.from_dict, validate_batch, properties_used
     ├── test_task3_features.py        # "Did you mean", new generator types, deduplication
     ├── test_llm_utils.py             # extract_cypher_from_text, format_records, repair_cypher,
     │                                 #   cypher_tool_spec, few_shot_examples, Schema prompt methods
     └── test_rag.py                   # GraphRAGPipeline — construction, query, repair loop, error handling
+```
+
+---
+
+## Examples
+
+The [`examples/`](examples/) directory contains 11 self-contained scripts covering every major feature. Each script uses the **real** `fastino/gliner2-large-v1` model (no mocks) and connects to a live Neo4j instance where applicable.
+
+| File | Topic | Requires |
+|------|-------|----------|
+| [`01_basic_validation.py`](examples/01_basic_validation.py) | Schema definition, single/batch validation, "did you mean?" | core |
+| [`02_schema_serialization.py`](examples/02_schema_serialization.py) | `to_dict`, `from_dict`, `to_json`, `from_json`, `merge`, prompt helpers | core |
+| [`03_cypher_generator.py`](examples/03_cypher_generator.py) | All 13 `CypherGenerator` query types, batch generation | core |
+| [`04_nl_to_cypher_basic.py`](examples/04_nl_to_cypher_basic.py) | `NLToCypher` with real GLiNER2 — CREATE / MERGE / MATCH modes | gliner2 |
+| [`05_db_aware_all_cases.py`](examples/05_db_aware_all_cases.py) | `db_aware=True` — 3 progressive rounds showing all MATCH/CREATE combinations | neo4j + gliner2 |
+| [`06_ner_extractors.py`](examples/06_ner_extractors.py) | `EntityNERExtractor` — spaCy and HuggingFace backends, custom `label_map` | ner |
+| [`07_db_aware_with_ner.py`](examples/07_db_aware_with_ner.py) | `db_aware=True` + real HuggingFace NER + real GLiNER2 + live Neo4j | neo4j + ner + gliner2 |
+| [`08_neo4j_database.py`](examples/08_neo4j_database.py) | `Neo4jDatabase` — execute, execute_many, execute_and_format, introspect_schema | neo4j |
+| [`09_llm_utils.py`](examples/09_llm_utils.py) | `extract_cypher_from_text`, `format_records`, `repair_cypher`, `cypher_tool_spec`, `few_shot_examples` | core |
+| [`10_graph_rag_pipeline.py`](examples/10_graph_rag_pipeline.py) | Schema introspection, Cypher validation + execution, result formatting | neo4j |
+| [`11_biobert_ner.py`](examples/11_biobert_ner.py) | BioBERT base vs fine-tuned biomedical NER — `label_map` adapter, full db_aware pipeline | neo4j + ner + gliner2 |
+
+Run the core examples (no extras needed):
+
+```bash
+for f in 01 02 03 09; do
+    echo "=== examples/${f}_*.py ===" && /path/to/python examples/0${f}_*.py
+done
 ```
 
 ---
@@ -1336,7 +1688,7 @@ maturin build --release
 ### Running tests
 
 ```bash
-# All 356 tests
+# All 395 tests
 pytest tests/
 
 # Specific test modules
@@ -1346,11 +1698,14 @@ pytest tests/test_task3_features.py -v   # "did you mean", new generator types, 
 # GLiNER2 integration only (no gliner2 package needed — uses mocks)
 pytest tests/test_gliner2_integration.py -v
 
+# DB-aware generation and EntityNERExtractor (no ML or live DB needed — uses mocks)
+pytest tests/test_db_aware.py -v
+
 # With coverage
 pytest tests/ --cov=cypher_validator
 ```
 
-The GLiNER2 tests use `unittest.mock` to simulate the model, so the full test suite runs without installing `gliner2`.
+All GLiNER2, NER, and Neo4j tests use `unittest.mock` to simulate models and the database driver, so the full test suite runs without installing `gliner2`, `spacy`, `transformers`, or a live Neo4j instance.
 
 ### Dependency management
 

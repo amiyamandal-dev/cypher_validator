@@ -15,6 +15,7 @@ from cypher_validator._cypher_validator import (  # noqa: F401
     parse_query,
 )
 from cypher_validator.gliner2_integration import (  # noqa: F401
+    EntityNERExtractor,
     GLiNER2RelationExtractor,
     RelationToCypherConverter,
     NLToCypher,
@@ -38,6 +39,7 @@ __all__ = [
     "QueryInfo",
     "parse_query",
     # GLiNER2 / Neo4j integration
+    "EntityNERExtractor",
     "GLiNER2RelationExtractor",
     "RelationToCypherConverter",
     "NLToCypher",

@@ -21,15 +21,18 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 dynamic = ["version"]
-dependencies = ["gliner2"]
+dependencies = [
+    "gliner2",
+    "neo4j>=6.1.0",
+    "urllib3>=2.2.3",
+    "spacy>=3.0", "transformers>=4.0", "torch",
+]
 
 [project.urls]
 Homepage = "https://github.com/amiyamandal-dev/cypher_validator"
 Repository = "https://github.com/amiyamandal-dev/cypher_validator"
 Issues = "https://github.com/amiyamandal-dev/cypher_validator/issues"
 
-[project.optional-dependencies]
-neo4j = ["neo4j>=5.0"]
 
 [tool.maturin]
 python-source = "python"
