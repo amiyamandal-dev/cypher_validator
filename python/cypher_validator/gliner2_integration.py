@@ -59,6 +59,33 @@ def _to_cypher_rel_type(rel_type: str) -> str:
     return rel_type.upper()
 
 
+def _inline_params(cypher: str, params: Dict[str, Any]) -> str:
+    """Substitute ``$placeholder`` tokens in *cypher* with their literal values.
+
+    Produces a human-readable Cypher string with actual entity values instead
+    of parameter references.  String values are double-quoted and internal
+    double-quotes / backslashes are escaped.  Non-string scalars (int, float,
+    bool, None) are rendered without quotes.
+
+    The substitution is applied longest-key-first to avoid partial replacement
+    (e.g. ``$a10_val`` must be replaced before ``$a1_val``).
+    """
+    result = cypher
+    for key in sorted(params.keys(), key=len, reverse=True):
+        val = params[key]
+        if val is None:
+            inline = "null"
+        elif isinstance(val, bool):
+            inline = "true" if val else "false"
+        elif isinstance(val, (int, float)):
+            inline = str(val)
+        else:
+            escaped = str(val).replace("\\", "\\\\").replace('"', '\\"')
+            inline = f'"{escaped}"'
+        result = result.replace(f"${key}", inline)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Neo4jDatabase
 # ---------------------------------------------------------------------------
@@ -1570,6 +1597,8 @@ class NLToCypher:
         else:
             cypher, params = self.converter.convert(relations, mode=mode, **kwargs)
 
+        readable = _inline_params(cypher, params)
+
         if execute:
             if self.db is None:
                 raise RuntimeError(
@@ -1578,9 +1607,9 @@ class NLToCypher:
                     "or via NLToCypher.from_pretrained(..., db=db)."
                 )
             results = self.db.execute(cypher, params) if cypher else []
-            return cypher, results
+            return readable, results
 
-        return cypher
+        return readable
 
     # ------------------------------------------------------------------
 
@@ -1645,6 +1674,8 @@ class NLToCypher:
         else:
             cypher, params = self.converter.convert(relations, mode=mode, **kwargs)
 
+        readable = _inline_params(cypher, params)
+
         if execute:
             if self.db is None:
                 raise RuntimeError(
@@ -1652,9 +1683,9 @@ class NLToCypher:
                     "Pass db=Neo4jDatabase(...) when constructing NLToCypher."
                 )
             results = self.db.execute(cypher, params) if cypher else []
-            return relations, cypher, results
+            return relations, readable, results
 
-        return relations, cypher
+        return relations, readable
 
     def __repr__(self) -> str:
         return (
