@@ -1431,9 +1431,14 @@ class NLToCypher:
         label from the schema, and queries the database to determine whether
         the entity already exists.
 
-        If a :class:`EntityNERExtractor` was provided at construction, its
-        labels enrich or override schema-based resolution (useful when the
-        schema is absent or incomplete).
+        When a :class:`EntityNERExtractor` is provided at construction the
+        method operates in **strict NER mode**: both the subject and object of
+        every triple must be independently confirmed by the NER model before
+        the triple is processed.  Spans not recognised by the NER model are
+        silently dropped, which prevents schema endpoint labels from being
+        blindly stamped onto non-entity words (e.g. "doctor" → ``Drug``).
+        Without an extractor the original schema-fallback behaviour is
+        preserved.
 
         Parameters
         ----------
@@ -1463,7 +1468,8 @@ class NLToCypher:
 
         # ── Build NER label map (if extractor provided) ──────────────────
         ner_labels: Dict[str, str] = {}
-        if self.ner_extractor is not None:
+        strict_ner = self.ner_extractor is not None
+        if strict_ner:
             for ent in self.ner_extractor.extract(text):
                 ner_labels[ent["text"]] = ent["label"]
 
@@ -1477,34 +1483,51 @@ class NLToCypher:
             src_label, tgt_label = self.converter._get_endpoints(cypher_rel)
 
             for subject, obj in pairs:
+                # Resolve labels before touching entity_status so we can
+                # gate the entire triple atomically.
+                sub_label = (
+                    ner_labels.get(subject)
+                    if strict_ner
+                    else ner_labels.get(subject, src_label)
+                )
+                obj_label = (
+                    ner_labels.get(obj)
+                    if strict_ner
+                    else ner_labels.get(obj, tgt_label)
+                )
+
+                # Strict mode: drop the triple if either span is unconfirmed
+                # by NER.  to_db_aware_query skips pairs whose entities are
+                # absent from entity_status, so no downstream changes needed.
+                if strict_ner and (sub_label is None or obj_label is None):
+                    continue
+
                 if subject not in entity_status:
                     var = f"e{idx}"
-                    label = ner_labels.get(subject, src_label)
                     entity_status[subject] = {
                         "var": var,
-                        "label": label,
+                        "label": sub_label or "",
                         "param_key": f"{var}_val",
                         "found": False,
                         "introduced": False,
                     }
                     idx += 1
-                elif not entity_status[subject]["label"] and src_label:
+                elif not entity_status[subject]["label"] and sub_label:
                     # Enrich label if we learn it from a new relation type
-                    entity_status[subject]["label"] = src_label
+                    entity_status[subject]["label"] = sub_label
 
                 if obj not in entity_status:
                     var = f"e{idx}"
-                    label = ner_labels.get(obj, tgt_label)
                     entity_status[obj] = {
                         "var": var,
-                        "label": label,
+                        "label": obj_label or "",
                         "param_key": f"{var}_val",
                         "found": False,
                         "introduced": False,
                     }
                     idx += 1
-                elif not entity_status[obj]["label"] and tgt_label:
-                    entity_status[obj]["label"] = tgt_label
+                elif not entity_status[obj]["label"] and obj_label:
+                    entity_status[obj]["label"] = obj_label
 
         # ── Query DB for each unique entity ──────────────────────────────
         for entity_name, info in entity_status.items():

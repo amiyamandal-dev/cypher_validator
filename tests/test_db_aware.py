@@ -738,3 +738,200 @@ class TestNLToCypherNerExtractor:
         ner.__repr__ = lambda s: "EntityNERExtractor(backend='spacy')"
         pipeline = NLToCypher(extractor, ner_extractor=ner)
         assert "ner_extractor" in repr(pipeline)
+
+
+# ---------------------------------------------------------------------------
+# Strict NER mode — _collect_entity_status drops unconfirmed spans
+# ---------------------------------------------------------------------------
+
+def _make_ner(entities: list[dict]):
+    """Return a mock EntityNERExtractor that returns *entities*."""
+    from cypher_validator import EntityNERExtractor
+    ner = MagicMock(spec=EntityNERExtractor)
+    ner.extract.return_value = entities
+    return ner
+
+
+class TestStrictNerMode:
+    """_collect_entity_status with ner_extractor set (strict mode).
+
+    Core invariant: when ner_extractor is provided, any triple whose subject
+    OR object is not returned by the NER model must be silently dropped — no
+    schema-endpoint label may be blindly stamped onto an unconfirmed span.
+    """
+
+    def _pipeline(self, ner_entities, relations, schema=None):
+        """Build a NLToCypher pipeline with a mocked NER extractor and DB."""
+        from cypher_validator import NLToCypher, Schema
+        if schema is None:
+            schema = Schema(
+                nodes={"Drug": ["name"], "Disease": ["name"]},
+                relationships={"TREATS": ("Drug", "Disease", [])},
+            )
+        extractor = _make_extractor(relations)
+        db = _make_db()
+        ner = _make_ner(ner_entities)
+        return NLToCypher(extractor, schema=schema, db=db, ner_extractor=ner), db
+
+    # ── Core: unconfirmed spans are dropped ──────────────────────────
+
+    def test_unconfirmed_subject_drops_triple(self):
+        """Triple dropped when subject is not in NER output."""
+        pipeline, db = self._pipeline(
+            ner_entities=[{"text": "patient", "label": "Disease"}],
+            relations={"TREATS": [("doctor", "patient")]},
+        )
+        status = pipeline._collect_entity_status(
+            "The doctor prescribed aspirin to the patient",
+            {"relation_extraction": {"TREATS": [("doctor", "patient")]}},
+            db,
+        )
+        # "doctor" not confirmed by NER → whole triple dropped
+        assert "doctor" not in status
+        assert "patient" not in status
+
+    def test_unconfirmed_object_drops_triple(self):
+        """Triple dropped when object is not in NER output."""
+        pipeline, db = self._pipeline(
+            ner_entities=[{"text": "aspirin", "label": "Drug"}],
+            relations={"TREATS": [("aspirin", "patient")]},
+        )
+        status = pipeline._collect_entity_status(
+            "aspirin treats patient",
+            {"relation_extraction": {"TREATS": [("aspirin", "patient")]}},
+            db,
+        )
+        assert "aspirin" not in status
+        assert "patient" not in status
+
+    def test_both_unconfirmed_drops_triple(self):
+        """Triple dropped when neither span is confirmed by NER."""
+        pipeline, db = self._pipeline(
+            ner_entities=[],  # NER found nothing
+            relations={"TREATS": [("doctor", "patient")]},
+        )
+        status = pipeline._collect_entity_status(
+            "The doctor prescribed aspirin to the patient",
+            {"relation_extraction": {"TREATS": [("doctor", "patient")]}},
+            db,
+        )
+        assert status == {}
+
+    def test_both_confirmed_triple_kept(self):
+        """Triple kept and NER labels used when both spans are confirmed."""
+        pipeline, db = self._pipeline(
+            ner_entities=[
+                {"text": "aspirin", "label": "Drug"},
+                {"text": "fever",   "label": "Disease"},
+            ],
+            relations={"TREATS": [("aspirin", "fever")]},
+        )
+        status = pipeline._collect_entity_status(
+            "aspirin treats fever",
+            {"relation_extraction": {"TREATS": [("aspirin", "fever")]}},
+            db,
+        )
+        assert "aspirin" in status
+        assert "fever" in status
+        assert status["aspirin"]["label"] == "Drug"
+        assert status["fever"]["label"] == "Disease"
+
+    # ── NER label overrides schema endpoint label ─────────────────────
+
+    def test_ner_label_overrides_schema_label(self):
+        """Confirmed entity uses NER label, not the schema endpoint label."""
+        pipeline, db = self._pipeline(
+            ner_entities=[
+                {"text": "aspirin",  "label": "Medication"},   # NER says Medication
+                {"text": "headache", "label": "Symptom"},
+            ],
+            relations={"TREATS": [("aspirin", "headache")]},
+        )
+        status = pipeline._collect_entity_status(
+            "aspirin treats headache",
+            {"relation_extraction": {"TREATS": [("aspirin", "headache")]}},
+            db,
+        )
+        # Schema would say Drug/Disease; NER wins
+        assert status["aspirin"]["label"] == "Medication"
+        assert status["headache"]["label"] == "Symptom"
+
+    # ── Selective triple filtering ────────────────────────────────────
+
+    def test_mixed_triples_only_confirmed_kept(self):
+        """Valid triple kept; triple with unconfirmed span dropped."""
+        from cypher_validator import Schema
+        schema = Schema(
+            nodes={"Drug": ["name"], "Disease": ["name"], "Gene": ["name"]},
+            relationships={
+                "TREATS":          ("Drug",    "Disease", []),
+                "ASSOCIATED_WITH": ("Gene",    "Disease", []),
+            },
+        )
+        pipeline, db = self._pipeline(
+            ner_entities=[
+                {"text": "aspirin", "label": "Drug"},
+                {"text": "fever",   "label": "Disease"},
+                # "BRCA1" and "cancer" absent → ASSOCIATED_WITH triple dropped
+            ],
+            relations={
+                "TREATS":          [("aspirin", "fever")],
+                "ASSOCIATED_WITH": [("BRCA1",   "cancer")],
+            },
+            schema=schema,
+        )
+        status = pipeline._collect_entity_status(
+            "aspirin treats fever; BRCA1 is associated with cancer",
+            {"relation_extraction": {
+                "TREATS":          [("aspirin", "fever")],
+                "ASSOCIATED_WITH": [("BRCA1",   "cancer")],
+            }},
+            db,
+        )
+        assert "aspirin" in status
+        assert "fever" in status
+        assert "BRCA1" not in status
+        assert "cancer" not in status
+
+    # ── No-extractor path is unchanged ───────────────────────────────
+
+    def test_no_ner_extractor_still_uses_schema_labels(self):
+        """Without ner_extractor, schema endpoint labels are used as before."""
+        from cypher_validator import NLToCypher, Schema
+        schema = Schema(
+            nodes={"Drug": ["name"], "Disease": ["name"]},
+            relationships={"TREATS": ("Drug", "Disease", [])},
+        )
+        extractor = _make_extractor({})
+        db = _make_db()
+        pipeline = NLToCypher(extractor, schema=schema, db=db)  # no ner_extractor
+
+        status = pipeline._collect_entity_status(
+            "doctor treats patient",
+            {"relation_extraction": {"TREATS": [("doctor", "patient")]}},
+            db,
+        )
+        # No NER → blind schema stamp still applies (legacy behaviour preserved)
+        assert status["doctor"]["label"] == "Drug"
+        assert status["patient"]["label"] == "Disease"
+
+    # ── End-to-end: unconfirmed spans produce no Cypher ───────────────
+
+    def test_db_aware_call_produces_no_cypher_for_unconfirmed_spans(self):
+        """Full db_aware call returns '' when NER rejects all spans."""
+        from cypher_validator import NLToCypher, Schema
+        schema = Schema(
+            nodes={"Drug": ["name"], "Disease": ["name"]},
+            relationships={"TREATS": ("Drug", "Disease", [])},
+        )
+        extractor = _make_extractor({"TREATS": [("doctor", "patient")]})
+        db = _make_db()
+        ner = _make_ner([])  # NER recognises nothing
+        pipeline = NLToCypher(extractor, schema=schema, db=db, ner_extractor=ner)
+
+        cypher = pipeline(
+            "The doctor prescribed aspirin to the patient",
+            ["treats"],
+            db_aware=True,
+        )
+        assert cypher == ""
