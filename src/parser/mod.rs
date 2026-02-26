@@ -18,6 +18,45 @@ pub fn parse(input: &str) -> Result<CypherQuery, CypherError> {
     builder::build_query(cypher_pair)
 }
 
+/// Parse result that preserves error position info before stringifying.
+pub struct ParseDetail {
+    pub error_message: String,
+    /// 1-based `(line, col)` extracted from pest error, if available.
+    pub position: Option<(u32, u32)>,
+}
+
+/// Like `parse()` but on failure returns structured error detail with position info.
+pub fn parse_with_detail(input: &str) -> Result<CypherQuery, ParseDetail> {
+    let pairs = <CypherParser as PestParser<Rule>>::parse(Rule::cypher, input);
+    match pairs {
+        Err(e) => {
+            let position = match e.line_col {
+                pest::error::LineColLocation::Pos((line, col)) => {
+                    Some((line as u32, col as u32))
+                }
+                pest::error::LineColLocation::Span((line, col), _) => {
+                    Some((line as u32, col as u32))
+                }
+            };
+            Err(ParseDetail {
+                error_message: e.to_string(),
+                position,
+            })
+        }
+        Ok(pairs) => {
+            let cypher_pair = pairs.into_iter().next()
+                .ok_or_else(|| ParseDetail {
+                    error_message: "No parse result".into(),
+                    position: None,
+                })?;
+            builder::build_query(cypher_pair).map_err(|e| ParseDetail {
+                error_message: e.to_string(),
+                position: None,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

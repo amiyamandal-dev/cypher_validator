@@ -35,6 +35,22 @@ class Schema:
         """Create a Schema from a plain Python dict (e.g. from ``to_dict()``)."""
         ...
 
+    @staticmethod
+    def from_neo4j(
+        uri: str,
+        username: str,
+        password: str,
+        database: str = "neo4j",
+        sample_limit: int = 1000,
+    ) -> Schema:
+        """Create a Schema by introspecting a live Neo4j database.
+
+        Convenience wrapper that creates a temporary :class:`Neo4jDatabase`,
+        calls :meth:`~Neo4jDatabase.introspect_schema`, closes the connection,
+        and returns the resulting :class:`Schema`.
+        """
+        ...
+
     # ----- Label / type queries -----
 
     def node_labels(self) -> List[str]:
@@ -80,6 +96,43 @@ class Schema:
 # ValidationResult
 # ---------------------------------------------------------------------------
 
+class ValidationDiagnostic:
+    """A single structured diagnostic with error code, suggestion, and position."""
+
+    code: str
+    """Short error code (e.g. ``"E201"``)."""
+
+    code_name: str
+    """Human-readable code name (e.g. ``"UnknownNodeLabel"``)."""
+
+    severity: str
+    """``"error"`` or ``"warning"``."""
+
+    message: str
+    """Full human-readable message."""
+
+    suggestion_original: Optional[str]
+    """Original text fragment to replace, or ``None``."""
+
+    suggestion_replacement: Optional[str]
+    """Suggested replacement text, or ``None``."""
+
+    suggestion_description: Optional[str]
+    """Human-readable description of the suggestion, or ``None``."""
+
+    position_line: Optional[int]
+    """1-based line number (parse errors only), or ``None``."""
+
+    position_col: Optional[int]
+    """1-based column number (parse errors only), or ``None``."""
+
+    def to_dict(self) -> Dict[str, object]:
+        """Return the diagnostic as a plain Python dict."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+
 class ValidationResult:
     """Result of validating a Cypher query against a :class:`Schema`."""
 
@@ -94,6 +147,23 @@ class ValidationResult:
 
     semantic_errors: List[str]
     """Schema-level semantic errors only."""
+
+    warnings: List[str]
+    """Advisory warnings (not errors)."""
+
+    diagnostics: List[ValidationDiagnostic]
+    """Structured diagnostics with error codes and suggestions."""
+
+    fixed_query: Optional[str]
+    """Auto-corrected query when all errors have suggestions, or ``None``."""
+
+    def to_dict(self) -> Dict[str, object]:
+        """Return the result as a plain Python dict (includes diagnostics)."""
+        ...
+
+    def to_json(self) -> str:
+        """Return the result as a compact JSON string."""
+        ...
 
     def __bool__(self) -> bool:
         """``bool(result)`` — True when the query is valid."""

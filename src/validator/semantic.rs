@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use crate::schema::Schema;
 use crate::parser::ast::*;
+use crate::diagnostics::{ErrorCode, Suggestion, ValidationDiagnostic};
 
 /// TypeEnv maps variable names to a list of labels/rel-types they are bound to.
 pub type TypeEnv = HashMap<String, Vec<String>>;
@@ -70,25 +71,37 @@ fn closest_match<'a>(name: &str, candidates: &'a [String], max_dist: usize) -> O
     best.map(|(c, _)| c)
 }
 
-/// Build a "did you mean :X?" hint string, or empty string if no close match.
-fn did_you_mean_label(name: &str, candidates: &[String]) -> String {
+/// Build a "did you mean <prefix>X?" hint string, or empty string if no close match.
+fn did_you_mean(name: &str, candidates: &[String], prefix: &str) -> String {
     match closest_match(name, candidates, 3) {
-        Some(s) => format!(", did you mean :{s}?"),
+        Some(s) => format!(", did you mean {prefix}{s}?"),
         None => String::new(),
     }
 }
 
-fn did_you_mean_rel(name: &str, candidates: &[String]) -> String {
-    match closest_match(name, candidates, 3) {
-        Some(s) => format!(", did you mean :{s}?"),
-        None => String::new(),
-    }
+/// Build a `Suggestion` for a label/rel-type correction, or None if no close match.
+fn label_suggestion(name: &str, candidates: &[String], prefix: &str) -> Option<Suggestion> {
+    closest_match(name, candidates, 3).map(|replacement| Suggestion {
+        original: format!("{}{}", prefix, name),
+        replacement: format!("{}{}", prefix, replacement),
+        description: format!("Replace {}{} with {}{}", prefix, name, prefix, replacement),
+    })
+}
+
+/// Build a `Suggestion` for a property correction, or None if no close match.
+fn property_suggestion(name: &str, candidates: &[String]) -> Option<Suggestion> {
+    closest_match(name, candidates, 3).map(|replacement| Suggestion {
+        original: name.to_string(),
+        replacement: replacement.to_string(),
+        description: format!("Replace property '{}' with '{}'", name, replacement),
+    })
 }
 
 pub struct SemanticValidator<'a> {
     pub schema: &'a Schema,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+    pub diagnostics: Vec<ValidationDiagnostic>,
     pub env: TypeEnv,
     /// Cached label list for "did you mean" suggestions — computed once per validation.
     known_labels: Vec<String>,
@@ -104,11 +117,48 @@ impl<'a> SemanticValidator<'a> {
             schema,
             errors: vec![],
             warnings: vec![],
+            diagnostics: vec![],
             env: HashMap::new(),
             known_labels,
             known_rel_types,
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // Diagnostic push helpers
+    // ---------------------------------------------------------------------------
+
+    /// Push an error diagnostic (also appends to legacy `errors` vec).
+    fn push_error(&mut self, code: ErrorCode, message: String, suggestion: Option<Suggestion>) {
+        self.errors.push(message.clone());
+        let mut diag = ValidationDiagnostic::error(code, message);
+        if let Some(s) = suggestion {
+            diag = diag.with_suggestion(s);
+        }
+        self.diagnostics.push(diag);
+    }
+
+    /// Push a warning diagnostic (also appends to legacy `warnings` vec).
+    fn push_warning(&mut self, code: ErrorCode, message: String) {
+        self.warnings.push(message.clone());
+        self.diagnostics.push(ValidationDiagnostic::warning(code, message));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Property candidate helpers for "did you mean"
+    // ---------------------------------------------------------------------------
+
+    fn node_property_candidates(&self, label: &str) -> Vec<String> {
+        self.schema.node_properties(label).into_iter().map(|s| s.to_string()).collect()
+    }
+
+    fn rel_property_candidates(&self, rel_type: &str) -> Vec<String> {
+        self.schema.rel_properties(rel_type).into_iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---------------------------------------------------------------------------
+    // Query validation entry
+    // ---------------------------------------------------------------------------
 
     pub fn validate_query(&mut self, query: &CypherQuery) {
         match &query.statement {
@@ -354,7 +404,8 @@ impl<'a> SemanticValidator<'a> {
                 has_first = true;
             } else if vars.is_disjoint(&connected) {
                 // This part shares no variable with any previously seen part → Cartesian
-                self.warnings.push(
+                self.push_warning(
+                    ErrorCode::W101CartesianProduct,
                     "MATCH pattern contains disconnected parts that will produce a Cartesian \
                      product; add a relationship or shared variable to connect them"
                         .to_string(),
@@ -414,11 +465,15 @@ impl<'a> SemanticValidator<'a> {
     /// does not support aggregation (e.g. MATCH WHERE, SET, DELETE).
     fn validate_expr_no_aggregate(&mut self, expr: &Expr, context: &str) {
         if Self::contains_aggregate(expr) {
-            self.errors.push(format!(
-                "Aggregate function not allowed in {} context; \
-                 aggregates are only valid in RETURN, WITH, or ORDER BY",
-                context
-            ));
+            self.push_error(
+                ErrorCode::E602AggregateInForbiddenContext,
+                format!(
+                    "Aggregate function not allowed in {} context; \
+                     aggregates are only valid in RETURN, WITH, or ORDER BY",
+                    context
+                ),
+                None,
+            );
         }
         self.validate_expr(expr);
     }
@@ -427,18 +482,26 @@ impl<'a> SemanticValidator<'a> {
     /// not a string, boolean, null, or float.
     fn validate_pagination_expr(&mut self, expr: &Expr, context: &str) {
         match expr {
-            Expr::Str(_) => self.errors.push(format!(
-                "{} expression must be an integer, got a string literal", context
-            )),
-            Expr::Bool(_) => self.errors.push(format!(
-                "{} expression must be an integer, got a boolean literal", context
-            )),
-            Expr::Null => self.errors.push(format!(
-                "{} expression must be an integer, got NULL", context
-            )),
-            Expr::Float(_) => self.errors.push(format!(
-                "{} expression must be an integer, got a float literal", context
-            )),
+            Expr::Str(_) => self.push_error(
+                ErrorCode::E611PaginationTypeString,
+                format!("{} expression must be an integer, got a string literal", context),
+                None,
+            ),
+            Expr::Bool(_) => self.push_error(
+                ErrorCode::E612PaginationTypeBool,
+                format!("{} expression must be an integer, got a boolean literal", context),
+                None,
+            ),
+            Expr::Null => self.push_error(
+                ErrorCode::E613PaginationTypeNull,
+                format!("{} expression must be an integer, got NULL", context),
+                None,
+            ),
+            Expr::Float(_) => self.push_error(
+                ErrorCode::E614PaginationTypeFloat,
+                format!("{} expression must be an integer, got a float literal", context),
+                None,
+            ),
             _ => self.validate_expr(expr),
         }
     }
@@ -452,7 +515,8 @@ impl<'a> SemanticValidator<'a> {
                     || part.element.chain.iter().any(|(_, n)| n.labels.is_empty())
             })
         {
-            self.warnings.push(
+            self.push_warning(
+                ErrorCode::W201UnlabeledFullScan,
                 "MATCH contains an unlabeled node with no WHERE clause; \
                  this will scan all nodes in the graph"
                     .to_string(),
@@ -464,7 +528,8 @@ impl<'a> SemanticValidator<'a> {
             for (rel, _) in &part.element.chain {
                 if let Some(r) = &rel.range {
                     if r.max.is_none() {
-                        self.warnings.push(
+                        self.push_warning(
+                            ErrorCode::W202UnboundedVarLength,
                             "Variable-length relationship without an upper bound ([*] or [*n..]) \
                              may cause unbounded traversal"
                                 .to_string(),
@@ -527,9 +592,11 @@ impl<'a> SemanticValidator<'a> {
             });
             if let Some(n) = name {
                 if !seen.insert(n.clone()) {
-                    self.errors.push(format!(
-                        "Duplicate projection name '{}' in RETURN/WITH", n
-                    ));
+                    self.push_error(
+                        ErrorCode::E502DuplicateProjectionName,
+                        format!("Duplicate projection name '{}' in RETURN/WITH", n),
+                        None,
+                    );
                 }
             }
         }
@@ -553,17 +620,23 @@ impl<'a> SemanticValidator<'a> {
     fn validate_node_pattern(&mut self, node: &NodePattern) {
         for label in &node.labels {
             if !self.schema.has_node_label(label) {
-                let hint = did_you_mean_label(label, &self.known_labels);
-                self.errors.push(format!("Unknown node label: :{}{}", label, hint));
+                let hint = did_you_mean(label, &self.known_labels, ":");
+                let message = format!("Unknown node label: :{}{}", label, hint);
+                let suggestion = label_suggestion(label, &self.known_labels, ":");
+                self.push_error(ErrorCode::E201UnknownNodeLabel, message, suggestion);
             }
         }
         if let Some(MapOrParam::Map(map)) = &node.properties {
             for key in map.keys() {
                 for label in &node.labels {
                     if self.schema.has_node_label(label) && !self.schema.node_has_property(label, key) {
-                        self.errors.push(format!(
-                            "Unknown property '{}' for node label :{}", key, label
-                        ));
+                        let candidates = self.node_property_candidates(label);
+                        let hint = did_you_mean(key, &candidates, ".");
+                        let message = format!(
+                            "Unknown property '{}' for node label :{}{}", key, label, hint
+                        );
+                        let suggestion = property_suggestion(key, &candidates);
+                        self.push_error(ErrorCode::E301UnknownNodeProperty, message, suggestion);
                     }
                 }
             }
@@ -579,8 +652,10 @@ impl<'a> SemanticValidator<'a> {
     ) {
         for rel_type in &rel.rel_types {
             if !self.schema.has_rel_type(rel_type) {
-                let hint = did_you_mean_rel(rel_type, &self.known_rel_types);
-                self.errors.push(format!("Unknown relationship type: :{}{}", rel_type, hint));
+                let hint = did_you_mean(rel_type, &self.known_rel_types, ":");
+                let message = format!("Unknown relationship type: :{}{}", rel_type, hint);
+                let suggestion = label_suggestion(rel_type, &self.known_rel_types, ":");
+                self.push_error(ErrorCode::E211UnknownRelType, message, suggestion);
                 continue; // skip endpoint check for unknown types
             }
 
@@ -588,9 +663,13 @@ impl<'a> SemanticValidator<'a> {
             if let Some(MapOrParam::Map(map)) = &rel.properties {
                 for key in map.keys() {
                     if !self.schema.rel_has_property(rel_type, key) {
-                        self.errors.push(format!(
-                            "Unknown property '{}' for relationship type :{}", key, rel_type
-                        ));
+                        let candidates = self.rel_property_candidates(rel_type);
+                        let hint = did_you_mean(key, &candidates, ".");
+                        let message = format!(
+                            "Unknown property '{}' for relationship type :{}{}", key, rel_type, hint
+                        );
+                        let suggestion = property_suggestion(key, &candidates);
+                        self.push_error(ErrorCode::E302UnknownRelProperty, message, suggestion);
                     }
                 }
             }
@@ -638,13 +717,17 @@ impl<'a> SemanticValidator<'a> {
         // Only report if at least one label is a known schema label
         // (avoids redundant errors on top of "Unknown node label" errors)
         if node.labels.iter().any(|l| self.schema.has_node_label(l)) {
-            self.errors.push(format!(
-                "Relationship :{} expects {} label :{}, but node has label(s): {}",
-                rel_type,
-                role,
-                expected,
-                node.labels.iter().map(|l| format!(":{}", l)).collect::<Vec<_>>().join(", ")
-            ));
+            self.push_error(
+                ErrorCode::E401WrongEndpointLabel,
+                format!(
+                    "Relationship :{} expects {} label :{}, but node has label(s): {}",
+                    rel_type,
+                    role,
+                    expected,
+                    node.labels.iter().map(|l| format!(":{}", l)).collect::<Vec<_>>().join(", ")
+                ),
+                None,
+            );
         }
     }
 
@@ -659,8 +742,10 @@ impl<'a> SemanticValidator<'a> {
             SetItem::LabelSet { var: _, labels } => {
                 for label in labels {
                     if !self.schema.has_node_label(label) {
-                        let hint = did_you_mean_label(label, &self.known_labels);
-                        self.errors.push(format!("Unknown node label in SET: :{}{}", label, hint));
+                        let hint = did_you_mean(label, &self.known_labels, ":");
+                        let message = format!("Unknown node label in SET: :{}{}", label, hint);
+                        let suggestion = label_suggestion(label, &self.known_labels, ":");
+                        self.push_error(ErrorCode::E202UnknownNodeLabelInSet, message, suggestion);
                     }
                 }
             }
@@ -672,8 +757,10 @@ impl<'a> SemanticValidator<'a> {
             RemoveItem::LabelRemove { labels, .. } => {
                 for label in labels {
                     if !self.schema.has_node_label(label) {
-                        let hint = did_you_mean_label(label, &self.known_labels);
-                        self.errors.push(format!("Unknown node label in REMOVE: :{}{}", label, hint));
+                        let hint = did_you_mean(label, &self.known_labels, ":");
+                        let message = format!("Unknown node label in REMOVE: :{}{}", label, hint);
+                        let suggestion = label_suggestion(label, &self.known_labels, ":");
+                        self.push_error(ErrorCode::E203UnknownNodeLabelInRemove, message, suggestion);
                     }
                 }
             }
@@ -689,17 +776,25 @@ impl<'a> SemanticValidator<'a> {
                 if self.schema.has_node_label(label) {
                     for prop in props {
                         if !self.schema.node_has_property(label, prop) {
-                            self.errors.push(format!(
-                                "Unknown property '{}' on variable '{}' with label :{}", prop, var, label
-                            ));
+                            let candidates = self.node_property_candidates(label);
+                            let hint = did_you_mean(prop, &candidates, ".");
+                            let message = format!(
+                                "Unknown property '{}' on variable '{}' with label :{}{}", prop, var, label, hint
+                            );
+                            let suggestion = property_suggestion(prop, &candidates);
+                            self.push_error(ErrorCode::E303UnknownNodePropertyOnVar, message, suggestion);
                         }
                     }
                 } else if self.schema.has_rel_type(label) {
                     for prop in props {
                         if !self.schema.rel_has_property(label, prop) {
-                            self.errors.push(format!(
-                                "Unknown property '{}' on variable '{}' with relationship type :{}", prop, var, label
-                            ));
+                            let candidates = self.rel_property_candidates(label);
+                            let hint = did_you_mean(prop, &candidates, ".");
+                            let message = format!(
+                                "Unknown property '{}' on variable '{}' with relationship type :{}{}", prop, var, label, hint
+                            );
+                            let suggestion = property_suggestion(prop, &candidates);
+                            self.push_error(ErrorCode::E304UnknownRelPropertyOnVar, message, suggestion);
                         }
                     }
                 }
@@ -714,7 +809,11 @@ impl<'a> SemanticValidator<'a> {
             // ===== Unbound variable detection =====
             Expr::Variable(name) => {
                 if !self.env.contains_key(name.as_str()) {
-                    self.errors.push(format!("Variable '{}' is not bound in this scope", name));
+                    self.push_error(
+                        ErrorCode::E501UnboundVariable,
+                        format!("Variable '{}' is not bound in this scope", name),
+                        None,
+                    );
                 }
             }
 
@@ -752,10 +851,14 @@ impl<'a> SemanticValidator<'a> {
                 if NUMERIC_AGGREGATES.contains(&norm.as_str()) {
                     for arg in args {
                         if let Expr::Str(_) = arg {
-                            self.errors.push(format!(
-                                "Aggregate function {}() received a string literal; expected a numeric expression",
-                                name
-                            ));
+                            self.push_error(
+                                ErrorCode::E601AggregateStringArg,
+                                format!(
+                                    "Aggregate function {}() received a string literal; expected a numeric expression",
+                                    name
+                                ),
+                                None,
+                            );
                         }
                     }
                 }

@@ -277,6 +277,12 @@ def repair_cypher(
     for _ in range(max_retries):
         if result.is_valid:
             break
+        # Try auto-fix before calling the LLM
+        if result.fixed_query is not None:
+            query = result.fixed_query
+            result = validator.validate(query)
+            if result.is_valid:
+                break
         query = llm_fn(query, list(result.errors))
         result = validator.validate(query)
     return query, result

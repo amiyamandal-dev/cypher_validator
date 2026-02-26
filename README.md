@@ -1589,17 +1589,18 @@ cypher_validator/
 ├── src/                              # Rust source
 │   ├── lib.rs                        # PyO3 module registration
 │   ├── error.rs                      # CypherError enum
+│   ├── diagnostics.rs                # ErrorCode, Severity, Suggestion, ValidationDiagnostic
 │   ├── grammar/
 │   │   └── cypher.pest               # PEG grammar (Pest)
 │   ├── parser/
 │   │   ├── mod.rs                    # parse() entry point
 │   │   ├── ast.rs                    # AST types
-│   │   └── builder.rs                # Pest → AST builder
+│   │   └── builder.rs                # Pest → AST builder (shared filter-expression helper)
 │   ├── schema/
 │   │   └── mod.rs                    # Schema struct
 │   ├── validator/
 │   │   ├── mod.rs                    # CypherValidator, ValidationResult
-│   │   └── semantic.rs               # SemanticValidator (labels, props, scope, "did you mean")
+│   │   └── semantic.rs               # SemanticValidator (labels, props, scope, suggestions)
 │   ├── generator/
 │   │   └── mod.rs                    # CypherGenerator (13 query types)
 │   └── bindings/

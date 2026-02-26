@@ -10,6 +10,7 @@ from cypher_validator._cypher_validator import (  # noqa: F401
     Schema,
     CypherValidator,
     ValidationResult,
+    ValidationDiagnostic,
     CypherGenerator,
     QueryInfo,
     parse_query,
@@ -29,12 +30,52 @@ from cypher_validator.llm_utils import (  # noqa: F401
     few_shot_examples,
 )
 from cypher_validator.rag import GraphRAGPipeline  # noqa: F401
+from cypher_validator.llm_pipeline import (  # noqa: F401
+    LLMNLToCypher,
+    ChunkResult,
+    IngestionResult,
+)
+
+# ---------------------------------------------------------------------------
+# Schema.from_neo4j() convenience wrapper
+# ---------------------------------------------------------------------------
+
+def _schema_from_neo4j(uri, username, password, database="neo4j", sample_limit=1000):
+    """Create a Schema by introspecting a live Neo4j database.
+
+    Parameters
+    ----------
+    uri : str
+        Bolt/neo4j URI, e.g. ``"bolt://localhost:7687"``.
+    username : str
+        Neo4j username.
+    password : str
+        Neo4j password.
+    database : str
+        Target database name (default: ``"neo4j"``).
+    sample_limit : int
+        Maximum number of nodes/relationships to sample per label/type
+        when procedure-based discovery is unavailable (default: 1000).
+
+    Returns
+    -------
+    Schema
+        A fully populated schema discovered from the database.
+    """
+    db = Neo4jDatabase(uri, username, password, database=database)
+    try:
+        return db.introspect_schema(sample_limit=sample_limit)
+    finally:
+        db.close()
+
+Schema.from_neo4j = staticmethod(_schema_from_neo4j)
 
 __all__ = [
     # Rust core
     "Schema",
     "CypherValidator",
     "ValidationResult",
+    "ValidationDiagnostic",
     "CypherGenerator",
     "QueryInfo",
     "parse_query",
@@ -52,4 +93,9 @@ __all__ = [
     "few_shot_examples",
     # RAG pipeline
     "GraphRAGPipeline",
+    # LLM NL-to-Cypher pipeline
+    "LLMNLToCypher",
+    # Batch ingestion
+    "ChunkResult",
+    "IngestionResult",
 ]

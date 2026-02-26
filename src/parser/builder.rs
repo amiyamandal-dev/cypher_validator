@@ -860,6 +860,27 @@ fn build_case_expression(pair: Pair<Rule>) -> Result<Expr, CypherError> {
     Ok(Expr::Case { subject, alternatives, default })
 }
 
+/// Parse a `filter_expression` pair into (variable, source, optional filter predicate).
+fn parse_filter_expression(pair: Pair<Rule>) -> Result<(String, Expr, Option<Box<Expr>>), CypherError> {
+    let mut variable = String::new();
+    let mut source = Expr::Null;
+    let mut filter = None;
+    for sub in pair.into_inner() {
+        match sub.as_rule() {
+            Rule::id_in_coll => {
+                let mut ic = sub.into_inner();
+                variable = ic.next().map(|p| p.as_str().to_string()).unwrap_or_default();
+                if let Some(src_pair) = ic.next() {
+                    source = build_expression(src_pair)?;
+                }
+            }
+            Rule::expression => filter = Some(Box::new(build_expression(sub)?)),
+            _ => {}
+        }
+    }
+    Ok((variable, source, filter))
+}
+
 fn build_list_comprehension(pair: Pair<Rule>) -> Result<Expr, CypherError> {
     let mut variable = String::new();
     let mut source = Expr::Null;
@@ -868,19 +889,10 @@ fn build_list_comprehension(pair: Pair<Rule>) -> Result<Expr, CypherError> {
     for child in pair.into_inner() {
         match child.as_rule() {
             Rule::filter_expression => {
-                for sub in child.into_inner() {
-                    match sub.as_rule() {
-                        Rule::id_in_coll => {
-                            let mut ic = sub.into_inner();
-                            variable = ic.next().map(|p| p.as_str().to_string()).unwrap_or_default();
-                            if let Some(src_pair) = ic.next() {
-                                source = build_expression(src_pair)?;
-                            }
-                        }
-                        Rule::expression => filter = Some(Box::new(build_expression(sub)?)),
-                        _ => {}
-                    }
-                }
+                let parsed = parse_filter_expression(child)?;
+                variable = parsed.0;
+                source = parsed.1;
+                filter = parsed.2;
             }
             Rule::expression => projection = Some(Box::new(build_expression(child)?)),
             _ => {}
@@ -900,19 +912,10 @@ fn build_quantifier_expression(pair: Pair<Rule>) -> Result<Expr, CypherError> {
     let mut filter = None;
     for child in pair.into_inner() {
         if child.as_rule() == Rule::filter_expression {
-            for sub in child.into_inner() {
-                match sub.as_rule() {
-                    Rule::id_in_coll => {
-                        let mut ic = sub.into_inner();
-                        variable = ic.next().map(|p| p.as_str().to_string()).unwrap_or_default();
-                        if let Some(src_pair) = ic.next() {
-                            source = build_expression(src_pair)?;
-                        }
-                    }
-                    Rule::expression => filter = Some(Box::new(build_expression(sub)?)),
-                    _ => {}
-                }
-            }
+            let parsed = parse_filter_expression(child)?;
+            variable = parsed.0;
+            source = parsed.1;
+            filter = parsed.2;
         }
     }
     match kind {

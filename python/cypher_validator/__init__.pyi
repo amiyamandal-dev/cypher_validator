@@ -5,17 +5,54 @@ Re-exports the Rust core and the pure-Python GLiNER2 / Neo4j integration.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, overload
 
 # Re-export Rust core types
 from cypher_validator._cypher_validator import (
     Schema as Schema,
     ValidationResult as ValidationResult,
+    ValidationDiagnostic as ValidationDiagnostic,
     CypherValidator as CypherValidator,
     QueryInfo as QueryInfo,
     CypherGenerator as CypherGenerator,
     parse_query as parse_query,
 )
+
+
+# ---------------------------------------------------------------------------
+# Batch ingestion dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChunkResult:
+    """Result of ingesting a single text chunk."""
+
+    index: int
+    source_id: str
+    text_preview: str
+    cypher: str
+    provenance_cypher: str
+    is_valid: bool
+    validation_errors: list[str] = field(default_factory=list)
+    repair_attempts: int = 0
+    executed: bool = False
+    execution_error: str | None = None
+    records: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class IngestionResult:
+    """Aggregate result of a batch ingestion run."""
+
+    schema: Any
+    schema_source: str
+    results: list[ChunkResult] = field(default_factory=list)
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    schema_sample_texts: int = 0
+    errors: list[tuple[int, str]] = field(default_factory=list)
 
 # ---------------------------------------------------------------------------
 # Schema (extended stubs for new methods)
@@ -35,6 +72,22 @@ class Schema:
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Schema":
         """Create a Schema from a plain Python dict."""
+        ...
+
+    @staticmethod
+    def from_neo4j(
+        uri: str,
+        username: str,
+        password: str,
+        database: str = "neo4j",
+        sample_limit: int = 1000,
+    ) -> "Schema":
+        """Create a Schema by introspecting a live Neo4j database.
+
+        Convenience wrapper that creates a temporary :class:`Neo4jDatabase`,
+        calls :meth:`~Neo4jDatabase.introspect_schema`, closes the connection,
+        and returns the resulting :class:`Schema`.
+        """
         ...
 
     @staticmethod
@@ -755,10 +808,235 @@ class GraphRAGPipeline:
     def __repr__(self) -> str: ...
 
 
+# ---------------------------------------------------------------------------
+# LLMNLToCypher
+# ---------------------------------------------------------------------------
+
+class LLMNLToCypher:
+    """LLM-based natural language to Cypher pipeline.
+
+    Unlike :class:`NLToCypher` (GLiNER2-based), this sends text directly to
+    an LLM to produce Cypher.  Supports any OpenAI-compatible backend or a
+    raw ``llm_fn`` callable.
+    """
+
+    schema: Any
+    db: Any
+    max_repair_retries: int
+    temperature: float
+
+    def __init__(
+        self,
+        *,
+        llm_fn: Optional[Callable[[str], str]] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        schema: Any = None,
+        db: Optional[Neo4jDatabase] = None,
+        max_repair_retries: int = 2,
+        temperature: float = 0.0,
+        system_prompt: Optional[str] = None,
+    ) -> None: ...
+
+    @classmethod
+    def from_openai(
+        cls,
+        model: str = "gpt-4o",
+        *,
+        api_key: Optional[str] = None,
+        schema: Any = None,
+        db: Optional[Neo4jDatabase] = None,
+        max_repair_retries: int = 2,
+        temperature: float = 0.0,
+        system_prompt: Optional[str] = None,
+    ) -> "LLMNLToCypher": ...
+
+    @classmethod
+    def from_deepseek(
+        cls,
+        model: str = "deepseek-chat",
+        *,
+        api_key: Optional[str] = None,
+        base_url: str = "https://api.deepseek.com",
+        schema: Any = None,
+        db: Optional[Neo4jDatabase] = None,
+        max_repair_retries: int = 2,
+        temperature: float = 0.0,
+        system_prompt: Optional[str] = None,
+    ) -> "LLMNLToCypher": ...
+
+    @classmethod
+    def from_anthropic(
+        cls,
+        model: str = "claude-sonnet-4-20250514",
+        *,
+        api_key: Optional[str] = None,
+        schema: Any = None,
+        db: Optional[Neo4jDatabase] = None,
+        max_repair_retries: int = 2,
+        temperature: float = 0.0,
+        system_prompt: Optional[str] = None,
+    ) -> "LLMNLToCypher": ...
+
+    @classmethod
+    def from_langchain(
+        cls,
+        chat_model: Any,
+        *,
+        schema: Any = None,
+        db: Optional[Neo4jDatabase] = None,
+        max_repair_retries: int = 2,
+        system_prompt: Optional[str] = None,
+    ) -> "LLMNLToCypher":
+        """Create a pipeline from a LangChain ``BaseChatModel``.
+
+        Accepts any LangChain chat model (``ChatOpenAI``,
+        ``ChatAnthropic``, ``ChatOllama``, etc.).  Temperature and
+        other params should be configured on the model instance.
+
+        Requires the ``langchain-core`` package.
+        """
+        ...
+
+    @classmethod
+    def from_env(
+        cls,
+        model: Optional[str] = None,
+        *,
+        schema: Any = None,
+        database: str = "neo4j",
+        max_repair_retries: int = 2,
+        temperature: float = 0.0,
+        system_prompt: Optional[str] = None,
+    ) -> "LLMNLToCypher": ...
+
+    def close(self) -> None:
+        """Close the DB connection if this instance owns it."""
+        ...
+
+    def __enter__(self) -> "LLMNLToCypher": ...
+    def __exit__(self, *args: Any) -> None: ...
+
+    def reset_discovered_schema(self) -> None:
+        """Clear the cached DB-discovered / LLM-inferred schema."""
+        ...
+
+    # execute=False → str
+    @overload
+    def __call__(
+        self,
+        text: str,
+        mode: str = ...,
+        execute: Literal[False] = ...,
+    ) -> str: ...
+
+    # execute=True → (str, list[dict])
+    @overload
+    def __call__(
+        self,
+        text: str,
+        mode: str = ...,
+        execute: Literal[True] = ...,
+    ) -> Tuple[str, List[Dict[str, Any]]]: ...
+
+    def __call__(
+        self,
+        text: str,
+        mode: str = "create",
+        execute: bool = False,
+    ) -> Union[str, Tuple[str, List[Dict[str, Any]]]]:
+        """Generate Cypher from natural language text.
+
+        Parameters
+        ----------
+        text:
+            Natural language passage.
+        mode:
+            ``"create"``, ``"merge"``, or ``"match"``.
+        execute:
+            Execute the query and return ``(cypher, records)``.
+
+        Returns
+        -------
+        str
+            Cypher query when ``execute=False``.
+        tuple[str, list[dict]]
+            ``(cypher, records)`` when ``execute=True``.
+        """
+        ...
+
+    def ingest_with_context(
+        self,
+        text: str,
+        mode: str = "create",
+        execute: bool = False,
+    ) -> Dict[str, Any]:
+        """Generate Cypher and return all intermediate artefacts.
+
+        Returns a dict with keys: ``schema_source``, ``inferred_schema``,
+        ``cypher``, ``is_valid``, ``validation_errors``,
+        ``repair_attempts``, ``records``, ``execution_error``.
+        """
+        ...
+
+    @staticmethod
+    def _chunk_text(
+        text: str,
+        chunk_size: int = 2000,
+        chunk_overlap: int = 200,
+    ) -> List[str]:
+        """Split text into chunks respecting sentence boundaries."""
+        ...
+
+    @staticmethod
+    def _build_provenance_cypher(
+        domain_cypher: str,
+        chunk_id: str,
+        source_id: str,
+        text_preview: str,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Build deterministic provenance Cypher from parsed domain labels."""
+        ...
+
+    def ingest_texts(
+        self,
+        texts: List[str],
+        *,
+        source_ids: Optional[List[str]] = None,
+        execute: bool = False,
+        schema_sample_size: int = 3,
+        provenance: bool = True,
+        on_error: str = "skip",
+        progress_fn: Optional[Callable[[int, int], None]] = None,
+    ) -> IngestionResult:
+        """Batch-ingest texts into a knowledge graph."""
+        ...
+
+    def ingest_document(
+        self,
+        text: str,
+        *,
+        source_id: str = "doc",
+        chunk_size: int = 2000,
+        chunk_overlap: int = 200,
+        execute: bool = False,
+        schema_sample_size: int = 3,
+        provenance: bool = True,
+        on_error: str = "skip",
+        progress_fn: Optional[Callable[[int, int], None]] = None,
+    ) -> IngestionResult:
+        """Chunk a document and ingest all chunks."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+
 __all__ = [
     "Schema",
     "CypherValidator",
     "ValidationResult",
+    "ValidationDiagnostic",
     "CypherGenerator",
     "QueryInfo",
     "parse_query",
@@ -774,4 +1052,9 @@ __all__ = [
     "few_shot_examples",
     # RAG pipeline
     "GraphRAGPipeline",
+    # LLM NL-to-Cypher pipeline
+    "LLMNLToCypher",
+    # Batch ingestion
+    "ChunkResult",
+    "IngestionResult",
 ]
