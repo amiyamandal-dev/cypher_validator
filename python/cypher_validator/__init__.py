@@ -34,6 +34,7 @@ from cypher_validator.llm_pipeline import (  # noqa: F401
     LLMNLToCypher,
     ChunkResult,
     IngestionResult,
+    TokenBucketRateLimiter,
 )
 
 # ---------------------------------------------------------------------------
@@ -98,4 +99,6 @@ __all__ = [
     # Batch ingestion
     "ChunkResult",
     "IngestionResult",
+    # Async rate limiting
+    "TokenBucketRateLimiter",
 ]

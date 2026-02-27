@@ -35,12 +35,16 @@ Usage
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import math
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -85,6 +89,54 @@ class IngestionResult:
     failed: int = 0
     schema_sample_texts: int = 0
     errors: list[tuple[int, str]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Token-bucket rate limiter for TPM quotas
+# ---------------------------------------------------------------------------
+
+class TokenBucketRateLimiter:
+    """Async token-bucket rate limiter for LLM tokens-per-minute quotas.
+
+    Parameters
+    ----------
+    tpm : int
+        Maximum tokens per minute.
+    """
+
+    def __init__(self, tpm: int) -> None:
+        self.tpm = tpm
+        self._tokens = float(tpm)
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: int) -> None:
+        """Wait until *tokens* are available, then consume them."""
+        while True:
+            async with self._lock:
+                self._refill()
+                if self._tokens >= tokens:
+                    self._tokens -= tokens
+                    return
+                # Calculate wait time for enough tokens to refill
+                deficit = tokens - self._tokens
+                wait = deficit / (self.tpm / 60.0)
+            await asyncio.sleep(wait)
+
+    def _refill(self) -> None:
+        """Refill tokens based on elapsed time (called under lock)."""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(
+            float(self.tpm),
+            self._tokens + elapsed * (self.tpm / 60.0),
+        )
+        self._last_refill = now
+
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """Rough char-to-token estimate (1 token ≈ 4 chars)."""
+        return max(1, len(text) // 4)
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +279,7 @@ class LLMNLToCypher:
         self,
         *,
         llm_fn: Optional[Callable[[str], str]] = None,
+        async_llm_fn: Optional[Callable[[str], Awaitable[str]]] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
@@ -235,6 +288,8 @@ class LLMNLToCypher:
         max_repair_retries: int = 2,
         temperature: float = 0.0,
         system_prompt: Optional[str] = None,
+        tpm_limit: Optional[int] = None,
+        max_concurrency: int = 5,
     ) -> None:
         if llm_fn is None and model is None:
             raise ValueError("Provide either 'llm_fn' or 'model'.")
@@ -255,6 +310,13 @@ class LLMNLToCypher:
         self.temperature = temperature
         self._system_prompt_override = system_prompt
         self._owns_db = False
+
+        # Async support
+        self._async_llm_fn = async_llm_fn
+        self._rate_limiter = (
+            TokenBucketRateLimiter(tpm_limit) if tpm_limit else None
+        )
+        self._max_concurrency = max_concurrency
 
         # Cache for DB-discovered or LLM-inferred schema
         self._discovered_schema: Any = None
@@ -499,6 +561,12 @@ class LLMNLToCypher:
         return self
 
     def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "LLMNLToCypher":
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
         self.close()
 
     # ------------------------------------------------------------------
@@ -1153,6 +1221,330 @@ class LLMNLToCypher:
         db_info = "db" if self.db else "no db"
         return f"LLMNLToCypher({schema_info}, {db_info})"
 
+    # ------------------------------------------------------------------
+    # Async helpers
+    # ------------------------------------------------------------------
+
+    def _get_async_llm_fn(self) -> Callable[[str], Awaitable[str]]:
+        """Return the async LLM callable.
+
+        Uses ``self._async_llm_fn`` if set, otherwise wraps the sync
+        ``self._llm_fn`` via ``asyncio.to_thread``.
+        """
+        if self._async_llm_fn is not None:
+            return self._async_llm_fn
+
+        sync_fn = self._llm_fn
+
+        async def _wrapped(prompt: str) -> str:
+            return await asyncio.to_thread(sync_fn, prompt)
+
+        return _wrapped
+
+    async def _async_llm_call(self, prompt: str) -> str:
+        """Call the async LLM, applying rate limiting if configured."""
+        if self._rate_limiter is not None:
+            tokens = TokenBucketRateLimiter.estimate_tokens(prompt)
+            await self._rate_limiter.acquire(tokens)
+        fn = self._get_async_llm_fn()
+        return await fn(prompt)
+
+    # ------------------------------------------------------------------
+    # Async validation + repair
+    # ------------------------------------------------------------------
+
+    async def _avalidate_and_repair(
+        self, cypher: str, schema: Any
+    ) -> Tuple[str, bool, List[str], int]:
+        """Async version of :meth:`_validate_and_repair`."""
+        from cypher_validator import CypherValidator
+
+        if schema is None:
+            from cypher_validator import parse_query
+            info = parse_query(cypher)
+            return cypher, info.is_valid, list(info.errors), 0
+
+        validator = CypherValidator(schema)
+        result = validator.validate(cypher)
+        repair_attempts = 0
+
+        schema_context = schema.to_cypher_context()
+
+        while not result.is_valid and repair_attempts < self.max_repair_retries:
+            if result.fixed_query is not None:
+                cypher = result.fixed_query
+                result = validator.validate(cypher)
+                if result.is_valid:
+                    break
+
+            error_list = "\n".join(f"  - {e}" for e in result.errors)
+            repair_prompt = _REPAIR_PROMPT_WITH_SCHEMA.format(
+                schema_context=schema_context,
+                cypher=cypher,
+                error_list=error_list,
+            )
+            raw = await self._async_llm_call(repair_prompt)
+            cypher = extract_cypher_from_text(raw)
+            result = validator.validate(cypher)
+            repair_attempts += 1
+
+        return cypher, result.is_valid, list(result.errors), repair_attempts
+
+    # ------------------------------------------------------------------
+    # Async public API
+    # ------------------------------------------------------------------
+
+    async def acall(
+        self,
+        text: str,
+        mode: str = "create",
+        execute: bool = False,
+    ) -> Union[str, Tuple[str, List[Dict[str, Any]]]]:
+        """Async version of :meth:`__call__`."""
+        ctx = await self.aingest_with_context(text, mode=mode, execute=execute)
+        if execute:
+            return ctx["cypher"], ctx["records"]
+        return ctx["cypher"]
+
+    async def aingest_with_context(
+        self,
+        text: str,
+        mode: str = "create",
+        execute: bool = False,
+    ) -> Dict[str, Any]:
+        """Async version of :meth:`ingest_with_context`."""
+        schema = self._resolve_schema()
+        schema_source = (
+            "user" if self.schema is not None
+            else "db" if schema is not None
+            else "inferred"
+        )
+
+        system_msg, user_msg = self._build_prompt(text, mode)
+        prompt = f"{system_msg}\n\n{user_msg}"
+        raw_response = await self._async_llm_call(prompt)
+
+        inferred_schema: Optional[Dict[str, Any]] = None
+        if schema is None:
+            inferred_schema, cypher = self._parse_inferred_schema(raw_response)
+            if inferred_schema:
+                self._merge_inferred_schema(inferred_schema)
+                schema = self._discovered_schema
+        else:
+            cypher = extract_cypher_from_text(raw_response)
+
+        cypher, is_valid, errors, repair_attempts = (
+            await self._avalidate_and_repair(cypher, schema)
+        )
+
+        records: List[Dict[str, Any]] = []
+        execution_error: Optional[str] = None
+        if execute:
+            if self.db is None:
+                raise RuntimeError(
+                    "Cannot execute: no 'db' was provided to LLMNLToCypher."
+                )
+            try:
+                records = self.db.execute(cypher)
+            except Exception as exc:  # noqa: BLE001
+                execution_error = str(exc)
+
+        return {
+            "schema_source": schema_source,
+            "inferred_schema": inferred_schema,
+            "cypher": cypher,
+            "is_valid": is_valid,
+            "validation_errors": errors,
+            "repair_attempts": repair_attempts,
+            "records": records,
+            "execution_error": execution_error,
+        }
+
+    async def aingest_texts(
+        self,
+        texts: List[str],
+        *,
+        source_ids: Optional[List[str]] = None,
+        execute: bool = False,
+        schema_sample_size: int = 3,
+        provenance: bool = True,
+        on_error: str = "skip",
+        progress_fn: Optional[Callable[[int, int], None]] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> IngestionResult:
+        """Async version of :meth:`ingest_texts` with parallel Phase 2.
+
+        Phase 1 (schema inference) runs sequentially.
+        Phase 2 runs up to *max_concurrency* LLM calls concurrently.
+        """
+        if on_error not in ("skip", "raise"):
+            raise ValueError(
+                f"on_error must be 'skip' or 'raise', got {on_error!r}"
+            )
+
+        if not texts:
+            schema = self._resolve_schema()
+            schema_source = (
+                "user" if self.schema is not None
+                else "db" if schema is not None
+                else "inferred"
+            )
+            return IngestionResult(
+                schema=schema,
+                schema_source=schema_source,
+            )
+
+        if source_ids is None:
+            source_ids = [f"text_{i}" for i in range(len(texts))]
+        if len(source_ids) != len(texts):
+            raise ValueError(
+                f"source_ids length ({len(source_ids)}) != texts length ({len(texts)})"
+            )
+
+        concurrency = max_concurrency or self._max_concurrency
+        total = len(texts)
+        results: List[Optional[ChunkResult]] = [None] * total
+        errors: List[Tuple[int, str]] = []
+
+        schema = self._resolve_schema()
+        schema_source = (
+            "user" if self.schema is not None
+            else "db" if schema is not None
+            else "inferred"
+        )
+
+        # Phase 1: sequential schema stabilization
+        phase1_count = 0
+        if schema is None:
+            sample_count = min(schema_sample_size, total)
+            for i in range(sample_count):
+                phase1_count += 1
+                try:
+                    ctx = await self.aingest_with_context(
+                        texts[i], mode="create", execute=False
+                    )
+                    result = self._finish_chunk(
+                        i, source_ids[i], texts[i],
+                        ctx["cypher"], ctx["is_valid"],
+                        ctx["validation_errors"], ctx["repair_attempts"],
+                        provenance=provenance, execute=execute,
+                        on_error=on_error,
+                    )
+                    results[i] = result
+                except Exception as exc:
+                    if on_error == "raise":
+                        raise
+                    errors.append((i, str(exc)))
+                    results[i] = ChunkResult(
+                        index=i,
+                        source_id=source_ids[i],
+                        text_preview=texts[i][:80],
+                        cypher="",
+                        provenance_cypher="",
+                        is_valid=False,
+                        validation_errors=[str(exc)],
+                    )
+
+                if progress_fn is not None:
+                    progress_fn(i + 1, total)
+
+            schema = self._resolve_schema()
+
+        # Phase 2: parallel ingestion with semaphore
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _process_text(i: int) -> None:
+            async with sem:
+                try:
+                    if schema is not None:
+                        system_msg = _SYSTEM_PROMPT_INGEST.format(
+                            schema_context=schema.to_cypher_context()
+                        )
+                    else:
+                        system_msg = _SYSTEM_PROMPT_SCHEMA_UNKNOWN
+
+                    user_msg = (
+                        "Generate a MERGE query to upsert the entities "
+                        "and relationships.\n\nText: " + texts[i]
+                    )
+                    prompt = f"{system_msg}\n\n{user_msg}"
+                    raw_response = await self._async_llm_call(prompt)
+                    cypher = extract_cypher_from_text(raw_response)
+
+                    cypher, is_valid, validation_errors, repair_attempts = (
+                        await self._avalidate_and_repair(cypher, schema)
+                    )
+
+                    result = self._finish_chunk(
+                        i, source_ids[i], texts[i],
+                        cypher, is_valid, validation_errors, repair_attempts,
+                        provenance=provenance, execute=execute,
+                        on_error=on_error,
+                    )
+                    results[i] = result
+                except Exception as exc:
+                    if on_error == "raise":
+                        raise
+                    errors.append((i, str(exc)))
+                    results[i] = ChunkResult(
+                        index=i,
+                        source_id=source_ids[i],
+                        text_preview=texts[i][:80],
+                        cypher="",
+                        provenance_cypher="",
+                        is_valid=False,
+                        validation_errors=[str(exc)],
+                    )
+
+                if progress_fn is not None:
+                    progress_fn(i + 1, total)
+
+        phase2_indices = list(range(phase1_count, total))
+        await asyncio.gather(*[_process_text(i) for i in phase2_indices])
+
+        final_results = [r for r in results if r is not None]
+        succeeded = sum(1 for r in final_results if r.is_valid)
+        failed = sum(1 for r in final_results if not r.is_valid)
+
+        return IngestionResult(
+            schema=self._resolve_schema(),
+            schema_source=schema_source,
+            results=final_results,
+            total=total,
+            succeeded=succeeded,
+            failed=failed,
+            schema_sample_texts=phase1_count,
+            errors=errors,
+        )
+
+    async def aingest_document(
+        self,
+        text: str,
+        *,
+        source_id: str = "doc",
+        chunk_size: int = 2000,
+        chunk_overlap: int = 200,
+        execute: bool = False,
+        schema_sample_size: int = 3,
+        provenance: bool = True,
+        on_error: str = "skip",
+        progress_fn: Optional[Callable[[int, int], None]] = None,
+        max_concurrency: Optional[int] = None,
+    ) -> IngestionResult:
+        """Async version of :meth:`ingest_document`."""
+        chunks = self._chunk_text(text, chunk_size, chunk_overlap)
+        chunk_source_ids = [f"{source_id}_chunk_{i}" for i in range(len(chunks))]
+        return await self.aingest_texts(
+            chunks,
+            source_ids=chunk_source_ids,
+            execute=execute,
+            schema_sample_size=schema_sample_size,
+            provenance=provenance,
+            on_error=on_error,
+            progress_fn=progress_fn,
+            max_concurrency=max_concurrency,
+        )
+
 
 # ---------------------------------------------------------------------------
 # OpenAI SDK adapter (#1 — proper system/user message separation)
@@ -1313,5 +1705,92 @@ def _build_langchain_fn(chat_model: Any) -> Callable[[str], str]:
         result = chat_model.invoke(messages)
         # LangChain returns an AIMessage; .content is the text.
         return result.content if hasattr(result, "content") else str(result)
+
+    return call_llm
+
+
+# ---------------------------------------------------------------------------
+# Async SDK adapters
+# ---------------------------------------------------------------------------
+
+def _build_async_openai_fn(
+    model: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    temperature: float,
+) -> Callable[[str], Awaitable[str]]:
+    """Build an async ``(prompt) -> str`` callable backed by ``AsyncOpenAI``."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise ImportError(
+            "The 'openai' package is required for async OpenAI support.  "
+            "Install it with: pip install openai"
+        ) from exc
+
+    kwargs: Dict[str, Any] = {}
+    if base_url is not None:
+        kwargs["base_url"] = base_url
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+
+    client = AsyncOpenAI(**kwargs)
+
+    async def call_llm(prompt: str) -> str:
+        messages = _split_prompt_to_messages(prompt)
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+        )
+        return response.choices[0].message.content or ""
+
+    return call_llm
+
+
+def _build_async_anthropic_fn(
+    model: str,
+    api_key: Optional[str],
+    temperature: float,
+) -> Callable[[str], Awaitable[str]]:
+    """Build an async ``(prompt) -> str`` callable backed by ``AsyncAnthropic``."""
+    try:
+        import anthropic
+    except ImportError as exc:
+        raise ImportError(
+            "The 'anthropic' package is required for async Anthropic support.  "
+            "Install it with: pip install anthropic"
+        ) from exc
+
+    kwargs: Dict[str, Any] = {}
+    if api_key is not None:
+        kwargs["api_key"] = api_key
+
+    client = anthropic.AsyncAnthropic(**kwargs)
+
+    async def call_llm(prompt: str) -> str:
+        messages = _split_prompt_to_messages(prompt)
+        system_text = ""
+        user_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_text = msg["content"]
+            else:
+                user_messages.append(msg)
+        if not user_messages:
+            user_messages = [{"role": "user", "content": prompt}]
+
+        create_kwargs: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": 4096,
+            "messages": user_messages,
+        }
+        if system_text:
+            create_kwargs["system"] = system_text
+        if temperature > 0:
+            create_kwargs["temperature"] = temperature
+
+        response = await client.messages.create(**create_kwargs)
+        return response.content[0].text
 
     return call_llm
