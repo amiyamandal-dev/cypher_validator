@@ -15,6 +15,7 @@ The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.r
 * [GLiNER2 integration](#gliner2-integration): NLToCypher, DB-aware query generation, EntityNERExtractor, GLiNER2RelationExtractor, RelationToCypherConverter, Neo4jDatabase
 * [LLM integration](#llm-integration): Schema prompt helpers, extract_cypher_from_text, repair_cypher, format_records, few_shot_examples, cypher_tool_spec, GraphRAGPipeline
 * [LLM NL-to-Cypher pipeline](#llm-nl-to-cypher-pipeline): LLMNLToCypher, ingest_texts, ingest_document, ChunkResult, IngestionResult
+* [Async & parallel ingestion](#async--parallel-ingestion): acall, aingest_texts, aingest_document, TokenBucketRateLimiter
 * [What the validator checks](#what-the-validator-checks)
 * [Generated query types](#generated-query-types)
 * [Performance](#performance)
@@ -1646,6 +1647,171 @@ print(f"Chunked into {result.total} pieces, {result.succeeded} succeeded")
 | `provenance` | `True` | Generate `Chunk` / `MENTIONED_IN` provenance Cypher |
 | `on_error` | `"skip"` | `"skip"` or `"raise"` |
 | `progress_fn` | `None` | Callback `(current, total)` after each text |
+
+---
+
+## Async & parallel ingestion
+
+All synchronous methods have async counterparts that run LLM calls concurrently. Phase 1 (schema inference) stays sequential; Phase 2 runs up to `max_concurrency` LLM calls in parallel via `asyncio.Semaphore`. An optional token-bucket rate limiter prevents exceeding TPM (Tokens Per Minute) quotas.
+
+### Async single-text — `acall()`
+
+```python
+import asyncio
+from cypher_validator import LLMNLToCypher, Schema
+
+schema = Schema(
+    nodes={"Person": ["name"], "Company": ["name"]},
+    relationships={"WORKS_FOR": ("Person", "Company", [])},
+)
+
+pipeline = LLMNLToCypher.from_env(schema=schema)
+
+# acall() is the async version of __call__()
+cypher = asyncio.run(pipeline.acall("John works for Apple.", mode="create"))
+
+# With execution
+cypher, records = asyncio.run(
+    pipeline.acall("John works for Apple.", mode="create", execute=True)
+)
+```
+
+### Async batch ingestion — `aingest_texts()`
+
+```python
+import asyncio
+from cypher_validator import LLMNLToCypher, Schema
+
+schema = Schema(
+    nodes={"Person": ["name"], "Company": ["name"], "City": ["name"]},
+    relationships={
+        "WORKS_FOR": ("Person", "Company", []),
+        "LIVES_IN": ("Person", "City", []),
+    },
+)
+
+pipeline = LLMNLToCypher.from_env(schema=schema, max_concurrency=10)
+
+texts = [
+    "Alice works for Acme Corp in New York.",
+    "Bob is employed at Globex and lives in Chicago.",
+    "Carol joined Initech in San Francisco.",
+    # ... hundreds more
+]
+
+result = asyncio.run(pipeline.aingest_texts(
+    texts,
+    source_ids=["doc1", "doc2", "doc3"],
+    provenance=True,
+    max_concurrency=10,  # up to 10 concurrent LLM calls
+    progress_fn=lambda cur, tot: print(f"{cur}/{tot}"),
+))
+
+print(result.total, result.succeeded, result.failed)
+```
+
+### Async document ingestion — `aingest_document()`
+
+```python
+long_text = open("article.txt").read()
+
+result = asyncio.run(pipeline.aingest_document(
+    long_text,
+    source_id="article",
+    chunk_size=2000,
+    chunk_overlap=200,
+    max_concurrency=10,
+))
+```
+
+### Native async LLM callables
+
+By default, `acall()` / `aingest_texts()` wrap the sync `llm_fn` with `asyncio.to_thread()`. For true async I/O, pass an `async_llm_fn`:
+
+```python
+# Option 1: Custom async callable
+async def my_async_llm(prompt: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        resp = await session.post("https://api.example.com/v1/chat", json={"prompt": prompt})
+        return (await resp.json())["text"]
+
+pipeline = LLMNLToCypher(
+    llm_fn=lambda p: "",       # sync fallback (required)
+    async_llm_fn=my_async_llm, # used by all async methods
+    schema=schema,
+)
+```
+
+The library also provides built-in async SDK adapters (used internally by the async methods when `model=` is provided):
+
+```python
+from cypher_validator.llm_pipeline import _build_async_openai_fn, _build_async_anthropic_fn
+
+# AsyncOpenAI-backed callable
+async_fn = _build_async_openai_fn(model="gpt-4o", base_url=None, api_key="sk-...", temperature=0.0)
+
+# AsyncAnthropic-backed callable
+async_fn = _build_async_anthropic_fn(model="claude-sonnet-4-20250514", api_key="sk-...", temperature=0.0)
+```
+
+### TPM rate limiting — `TokenBucketRateLimiter`
+
+Pass `tpm_limit` to throttle LLM calls so they stay within your provider's tokens-per-minute quota:
+
+```python
+pipeline = LLMNLToCypher.from_env(
+    schema=schema,
+    tpm_limit=100_000,     # 100k tokens per minute
+    max_concurrency=10,    # up to 10 parallel calls
+)
+
+# All async methods automatically throttle via the token bucket
+result = asyncio.run(pipeline.aingest_texts(texts))
+```
+
+The rate limiter estimates token consumption as `len(prompt) // 4` and blocks until the bucket has sufficient capacity. The bucket refills continuously at `tpm / 60` tokens per second.
+
+You can also use `TokenBucketRateLimiter` standalone:
+
+```python
+from cypher_validator import TokenBucketRateLimiter
+
+limiter = TokenBucketRateLimiter(tpm=100_000)
+
+async def rate_limited_call(prompt: str) -> str:
+    tokens = TokenBucketRateLimiter.estimate_tokens(prompt)
+    await limiter.acquire(tokens)
+    return await my_llm(prompt)
+```
+
+### Async context manager
+
+```python
+async with LLMNLToCypher.from_env(schema=schema) as pipeline:
+    result = await pipeline.aingest_texts(texts)
+# DB connection closed automatically
+```
+
+### `aingest_texts()` parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `texts` | required | List of natural language passages |
+| `source_ids` | auto | Per-text identifiers (defaults to `text_0`, `text_1`, ...) |
+| `execute` | `False` | Execute Cypher against `self.db` |
+| `schema_sample_size` | `3` | Texts to sample for schema inference (Phase 1 — sequential) |
+| `provenance` | `True` | Generate `Chunk` / `MENTIONED_IN` provenance Cypher |
+| `on_error` | `"skip"` | `"skip"` or `"raise"` |
+| `progress_fn` | `None` | Callback `(current, total)` after each text |
+| `max_concurrency` | `None` | Override instance-level `max_concurrency` for this call |
+
+### Constructor async parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `async_llm_fn` | `None` | Async callable `(str) -> Awaitable[str]`. Falls back to `asyncio.to_thread(llm_fn)` if not set |
+| `tpm_limit` | `None` | Tokens-per-minute budget. `None` = no rate limiting |
+| `max_concurrency` | `5` | Default max parallel LLM calls for `aingest_texts()` |
 
 ---
 
