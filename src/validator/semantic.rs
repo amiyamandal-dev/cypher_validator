@@ -97,6 +97,105 @@ fn property_suggestion(name: &str, candidates: &[String]) -> Option<Suggestion> 
     })
 }
 
+// ---------------------------------------------------------------------------
+// Built-in function registry
+// ---------------------------------------------------------------------------
+
+struct CypherBuiltinFn {
+    name: &'static str,       // lowercase
+    min_args: usize,
+    max_args: Option<usize>,  // None = variadic
+    is_aggregate: bool,
+}
+
+const BUILTIN_FUNCTIONS: &[CypherBuiltinFn] = &[
+    // Aggregates
+    CypherBuiltinFn { name: "count",           min_args: 1, max_args: Some(1), is_aggregate: true },
+    CypherBuiltinFn { name: "collect",         min_args: 1, max_args: Some(1), is_aggregate: true },
+    CypherBuiltinFn { name: "sum",             min_args: 1, max_args: Some(1), is_aggregate: true },
+    CypherBuiltinFn { name: "avg",             min_args: 1, max_args: Some(1), is_aggregate: true },
+    CypherBuiltinFn { name: "min",             min_args: 1, max_args: Some(1), is_aggregate: true },
+    CypherBuiltinFn { name: "max",             min_args: 1, max_args: Some(1), is_aggregate: true },
+    CypherBuiltinFn { name: "stdev",           min_args: 1, max_args: Some(1), is_aggregate: true },
+    CypherBuiltinFn { name: "stdevp",          min_args: 1, max_args: Some(1), is_aggregate: true },
+    CypherBuiltinFn { name: "percentilecont",  min_args: 2, max_args: Some(2), is_aggregate: true },
+    CypherBuiltinFn { name: "percentiledisc",  min_args: 2, max_args: Some(2), is_aggregate: true },
+    // String
+    CypherBuiltinFn { name: "tolower",    min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "toupper",    min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "trim",       min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "ltrim",      min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "rtrim",      min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "replace",    min_args: 3, max_args: Some(3), is_aggregate: false },
+    CypherBuiltinFn { name: "substring",  min_args: 2, max_args: Some(3), is_aggregate: false },
+    CypherBuiltinFn { name: "left",       min_args: 2, max_args: Some(2), is_aggregate: false },
+    CypherBuiltinFn { name: "right",      min_args: 2, max_args: Some(2), is_aggregate: false },
+    CypherBuiltinFn { name: "split",      min_args: 2, max_args: Some(2), is_aggregate: false },
+    CypherBuiltinFn { name: "reverse",    min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "tostring",   min_args: 1, max_args: Some(1), is_aggregate: false },
+    // Numeric
+    CypherBuiltinFn { name: "abs",        min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "ceil",       min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "floor",      min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "round",      min_args: 1, max_args: Some(2), is_aggregate: false },
+    CypherBuiltinFn { name: "sign",       min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "rand",       min_args: 0, max_args: Some(0), is_aggregate: false },
+    CypherBuiltinFn { name: "tointeger",  min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "tofloat",    min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "sqrt",       min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "log",        min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "log10",      min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "exp",        min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "e",          min_args: 0, max_args: Some(0), is_aggregate: false },
+    CypherBuiltinFn { name: "pi",         min_args: 0, max_args: Some(0), is_aggregate: false },
+    CypherBuiltinFn { name: "sin",        min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "cos",        min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "tan",        min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "asin",       min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "acos",       min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "atan",       min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "atan2",      min_args: 2, max_args: Some(2), is_aggregate: false },
+    CypherBuiltinFn { name: "radians",    min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "degrees",    min_args: 1, max_args: Some(1), is_aggregate: false },
+    // List / Graph
+    CypherBuiltinFn { name: "size",          min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "head",          min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "tail",          min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "last",          min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "range",         min_args: 2, max_args: Some(3), is_aggregate: false },
+    CypherBuiltinFn { name: "keys",          min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "labels",        min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "nodes",         min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "relationships", min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "properties",    min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "type",          min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "id",            min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "elementid",     min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "startnode",     min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "endnode",       min_args: 1, max_args: Some(1), is_aggregate: false },
+    // Temporal
+    CypherBuiltinFn { name: "date",          min_args: 0, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "datetime",      min_args: 0, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "time",          min_args: 0, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "localtime",     min_args: 0, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "localdatetime", min_args: 0, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "duration",      min_args: 1, max_args: Some(1), is_aggregate: false },
+    // Spatial
+    CypherBuiltinFn { name: "point",    min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "distance", min_args: 2, max_args: Some(2), is_aggregate: false },
+    // Other
+    CypherBuiltinFn { name: "coalesce",   min_args: 1, max_args: None,    is_aggregate: false },
+    CypherBuiltinFn { name: "randomuuid", min_args: 0, max_args: Some(0), is_aggregate: false },
+    CypherBuiltinFn { name: "timestamp",  min_args: 0, max_args: Some(0), is_aggregate: false },
+    CypherBuiltinFn { name: "toboolean",  min_args: 1, max_args: Some(1), is_aggregate: false },
+    CypherBuiltinFn { name: "exists",     min_args: 1, max_args: Some(1), is_aggregate: false },
+];
+
+fn lookup_builtin(name: &str) -> Option<&'static CypherBuiltinFn> {
+    let lower = name.to_lowercase();
+    BUILTIN_FUNCTIONS.iter().find(|f| f.name == lower)
+}
+
 pub struct SemanticValidator<'a> {
     pub schema: &'a Schema,
     pub errors: Vec<String>,
@@ -288,6 +387,10 @@ impl<'a> SemanticValidator<'a> {
                     self.env.insert(yi.variable.clone(), vec![]);
                 }
             }
+            ReadingClause::CallSubquery(_) => {
+                // Bindings from CALL subquery are resolved during validation
+                // (the subquery's RETURN clause determines what's visible after)
+            }
         }
     }
 
@@ -361,6 +464,10 @@ impl<'a> SemanticValidator<'a> {
             }
             ReadingClause::Unwind(u) => self.validate_expr(&u.expr),
             ReadingClause::Call(_) => {}
+            ReadingClause::CallSubquery(rq) => {
+                // Outer scope visible inside; validate the inner query
+                self.validate_regular_query(rq);
+            }
         }
     }
 
@@ -422,14 +529,10 @@ impl<'a> SemanticValidator<'a> {
     /// Returns true if `expr` (anywhere in its subtree) contains an aggregate function call
     /// or COUNT(*), which are only valid in RETURN / WITH / ORDER BY projection context.
     fn contains_aggregate(expr: &Expr) -> bool {
-        const AGGREGATES: &[&str] = &[
-            "count", "collect", "sum", "avg", "min", "max",
-            "stdev", "stdevp", "percentilecont", "percentiledisc",
-        ];
         match expr {
             Expr::CountStar => true,
             Expr::FunctionCall { name, args, .. } => {
-                AGGREGATES.contains(&name.to_lowercase().as_str())
+                lookup_builtin(name).map_or(false, |f| f.is_aggregate)
                     || args.iter().any(Self::contains_aggregate)
             }
             Expr::Or(a, b) | Expr::Xor(a, b) | Expr::And(a, b)
@@ -843,24 +946,71 @@ impl<'a> SemanticValidator<'a> {
             }
 
             // ===== Function calls =====
-            Expr::FunctionCall { name, args, .. } => {
-                const NUMERIC_AGGREGATES: &[&str] = &[
-                    "sum", "avg", "stdev", "stdevp", "percentilecont", "percentiledisc",
-                ];
-                let norm = name.to_lowercase();
-                if NUMERIC_AGGREGATES.contains(&norm.as_str()) {
-                    for arg in args {
-                        if let Expr::Str(_) = arg {
-                            self.push_error(
-                                ErrorCode::E601AggregateStringArg,
-                                format!(
-                                    "Aggregate function {}() received a string literal; expected a numeric expression",
-                                    name
-                                ),
-                                None,
-                            );
+            Expr::FunctionCall { name, args, distinct } => {
+                if let Some(builtin) = lookup_builtin(name) {
+                    // Arity check
+                    let nargs = args.len();
+                    let bad_arity = if nargs < builtin.min_args {
+                        true
+                    } else if let Some(max) = builtin.max_args {
+                        nargs > max
+                    } else {
+                        false
+                    };
+                    if bad_arity {
+                        let expected = match builtin.max_args {
+                            Some(max) if max == builtin.min_args => format!("{}", builtin.min_args),
+                            Some(max) => format!("{}-{}", builtin.min_args, max),
+                            None => format!("at least {}", builtin.min_args),
+                        };
+                        self.push_error(
+                            ErrorCode::E603WrongArity,
+                            format!(
+                                "Function {}() expects {} argument(s), got {}",
+                                name, expected, nargs
+                            ),
+                            None,
+                        );
+                    }
+                    // DISTINCT on non-aggregate
+                    if *distinct && !builtin.is_aggregate {
+                        self.push_warning(
+                            ErrorCode::W104DistinctOnNonAggregate,
+                            format!(
+                                "DISTINCT is used with non-aggregate function {}(); \
+                                 DISTINCT only has meaning with aggregate functions",
+                                name
+                            ),
+                        );
+                    }
+                    // Numeric aggregate string-arg check (E601)
+                    const NUMERIC_AGGREGATES: &[&str] = &[
+                        "sum", "avg", "stdev", "stdevp", "percentilecont", "percentiledisc",
+                    ];
+                    let norm = name.to_lowercase();
+                    if NUMERIC_AGGREGATES.contains(&norm.as_str()) {
+                        for arg in args {
+                            if let Expr::Str(_) = arg {
+                                self.push_error(
+                                    ErrorCode::E601AggregateStringArg,
+                                    format!(
+                                        "Aggregate function {}() received a string literal; expected a numeric expression",
+                                        name
+                                    ),
+                                    None,
+                                );
+                            }
                         }
                     }
+                } else {
+                    // Unknown function — warn (UDFs are valid)
+                    self.push_warning(
+                        ErrorCode::W103UnknownFunction,
+                        format!(
+                            "Unknown function {}(); if this is a user-defined function, ignore this warning",
+                            name
+                        ),
+                    );
                 }
                 for a in args { self.validate_expr(a); }
             }
@@ -944,7 +1094,48 @@ impl<'a> SemanticValidator<'a> {
             Expr::Parameter(_) | Expr::Integer(_) | Expr::Float(_)
             | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::CountStar => {}
 
-            Expr::Exists(_) => {}
+            Expr::Exists(subquery) => {
+                match subquery.as_ref() {
+                    ExistsSubquery::Pattern(pat) => {
+                        let saved_env = self.env.clone();
+                        self.collect_pattern_bindings(pat);
+                        self.validate_pattern(pat);
+                        self.env = saved_env;
+                    }
+                    ExistsSubquery::Query(rq) => {
+                        let saved_env = self.env.clone();
+                        self.validate_regular_query(rq);
+                        self.env = saved_env;
+                    }
+                }
+            }
+
+            Expr::PatternComprehension { element, filter, projection } => {
+                let saved = self.env.clone();
+                // Collect bindings from the pattern element
+                self.collect_node_bindings(&element.start);
+                for (rel, node) in &element.chain {
+                    self.collect_rel_bindings(rel);
+                    self.collect_node_bindings(node);
+                }
+                // Validate the pattern
+                self.validate_node_pattern(&element.start);
+                let mut prev = &element.start;
+                for (rel, node) in &element.chain {
+                    self.validate_rel_pattern_with_endpoints(rel, prev, node);
+                    self.validate_node_pattern(node);
+                    prev = node;
+                }
+                if let Some(f) = filter { self.validate_expr(f); }
+                self.validate_expr(projection);
+                self.env = saved;  // inner bindings don't leak
+            }
+
+            Expr::CountSubquery(rq) | Expr::CollectSubquery(rq) => {
+                let saved = self.env.clone();
+                self.validate_regular_query(rq);
+                self.env = saved;
+            }
         }
     }
 }

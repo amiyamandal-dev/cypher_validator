@@ -100,6 +100,11 @@ fn build_reading_clause(pair: Pair<Rule>) -> Result<ReadingClause, CypherError> 
     match inner.as_rule() {
         Rule::match_clause => Ok(ReadingClause::Match(build_match_clause(inner)?)),
         Rule::unwind_clause => Ok(ReadingClause::Unwind(build_unwind_clause(inner)?)),
+        Rule::call_subquery => {
+            let rq = inner.into_inner().next()
+                .ok_or_else(|| CypherError::ParseError("Empty CALL subquery".into()))?;
+            Ok(ReadingClause::CallSubquery(build_regular_query(rq)?))
+        }
         Rule::in_query_call => Ok(ReadingClause::Call(build_call_clause(inner)?)),
         _ => Err(CypherError::ParseError(format!("Unknown reading clause: {:?}", inner.as_rule()))),
     }
@@ -778,9 +783,12 @@ fn build_atom(pair: Pair<Rule>) -> Result<Expr, CypherError> {
         Rule::literal => build_literal(inner),
         Rule::parameter => Ok(Expr::Parameter(inner.as_str().trim_start_matches('$').to_string())),
         Rule::case_expression => build_case_expression(inner),
+        Rule::pattern_comprehension => build_pattern_comprehension(inner),
         Rule::list_comprehension => build_list_comprehension(inner),
         Rule::quantifier_expression => build_quantifier_expression(inner),
         Rule::exists_subquery => build_exists_subquery(inner),
+        Rule::count_subquery => build_count_subquery(inner),
+        Rule::collect_subquery => build_collect_subquery(inner),
         Rule::count_star => Ok(Expr::CountStar),
         Rule::function_invocation => build_function_invocation(inner),
         Rule::variable => Ok(Expr::Variable(inner.as_str().to_string())),
@@ -933,6 +941,52 @@ fn build_exists_subquery(pair: Pair<Rule>) -> Result<Expr, CypherError> {
         Rule::pattern => Ok(Expr::Exists(Box::new(ExistsSubquery::Pattern(build_pattern(inner)?)))),
         _ => Err(CypherError::ParseError("Unknown EXISTS subquery type".into())),
     }
+}
+
+fn build_pattern_comprehension(pair: Pair<Rule>) -> Result<Expr, CypherError> {
+    let mut children = pair.into_inner();
+    let element = build_pattern_element(
+        children.next().ok_or_else(|| CypherError::ParseError("Pattern comprehension missing pattern".into()))?,
+    )?;
+    let mut filter = None;
+    let mut projection = None;
+    for child in children {
+        match child.as_rule() {
+            Rule::expression if projection.is_none() && filter.is_none() => {
+                // This could be the WHERE filter or the projection — but since
+                // the grammar puts WHERE before |, the first expression after
+                // pattern_element is the WHERE, and the second is the projection.
+                // However, if there's no WHERE, there's only one expression (projection).
+                // We handle this by collecting remaining expressions.
+                filter = Some(Box::new(build_expression(child)?));
+            }
+            Rule::expression => {
+                projection = Some(Box::new(build_expression(child)?));
+            }
+            _ => {}
+        }
+    }
+    // If only one expression was found, it's the projection (no WHERE clause)
+    if projection.is_none() {
+        projection = filter.take();
+    }
+    Ok(Expr::PatternComprehension {
+        element: Box::new(element),
+        filter,
+        projection: projection.ok_or_else(|| CypherError::ParseError("Pattern comprehension missing projection".into()))?,
+    })
+}
+
+fn build_count_subquery(pair: Pair<Rule>) -> Result<Expr, CypherError> {
+    let inner = pair.into_inner().next()
+        .ok_or_else(|| CypherError::ParseError("Empty COUNT subquery".into()))?;
+    Ok(Expr::CountSubquery(Box::new(build_regular_query(inner)?)))
+}
+
+fn build_collect_subquery(pair: Pair<Rule>) -> Result<Expr, CypherError> {
+    let inner = pair.into_inner().next()
+        .ok_or_else(|| CypherError::ParseError("Empty COLLECT subquery".into()))?;
+    Ok(Expr::CollectSubquery(Box::new(build_regular_query(inner)?)))
 }
 
 /// Build an `Expr::ShortestPath` from a `shortest_path_call` pair.

@@ -148,11 +148,17 @@ fn collect_reading(
     rels: &mut HashSet<String>,
     props: &mut HashSet<String>,
 ) {
-    if let ReadingClause::Match(m) = rc {
-        collect_pattern(&m.pattern, labels, rels, props);
-        if let Some(w) = &m.where_clause {
-            collect_expr(w, props);
+    match rc {
+        ReadingClause::Match(m) => {
+            collect_pattern(&m.pattern, labels, rels, props);
+            if let Some(w) = &m.where_clause {
+                collect_expr(w, props);
+            }
         }
+        ReadingClause::CallSubquery(rq) => {
+            collect_regular_query(rq, labels, rels, props);
+        }
+        _ => {}
     }
 }
 
@@ -267,6 +273,16 @@ fn collect_expr(expr: &Expr, props: &mut HashSet<String>) {
                 let mut r = HashSet::new();
                 collect_regular_query(rq, &mut l, &mut r, props);
             }
+        }
+        Expr::PatternComprehension { element, filter, projection, .. } => {
+            // Traverse filter and projection expressions for property references
+            if let Some(f) = filter { collect_expr(f, props); }
+            collect_expr(projection, props);
+        }
+        Expr::CountSubquery(rq) | Expr::CollectSubquery(rq) => {
+            let mut l = HashSet::new();
+            let mut r = HashSet::new();
+            collect_regular_query(rq, &mut l, &mut r, props);
         }
         // Leaf nodes: Variable, Integer, Float, Str, Bool, Null, Parameter, CountStar
         _ => {}

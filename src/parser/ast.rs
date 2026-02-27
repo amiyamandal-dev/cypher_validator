@@ -43,6 +43,7 @@ pub enum ReadingClause {
     Match(MatchClause),
     Unwind(UnwindClause),
     Call(CallClause),
+    CallSubquery(RegularQuery),
 }
 
 #[derive(Debug, Clone)]
@@ -288,8 +289,19 @@ pub enum Expr {
         element: Box<PatternElement>,
     },
 
+    // Pattern comprehension
+    PatternComprehension {
+        element: Box<PatternElement>,
+        filter: Option<Box<Expr>>,
+        projection: Box<Expr>,
+    },
+
     // Exists subquery
     Exists(Box<ExistsSubquery>),
+
+    // COUNT/COLLECT subqueries (Neo4j 5.x)
+    CountSubquery(Box<RegularQuery>),
+    CollectSubquery(Box<RegularQuery>),
 }
 
 #[derive(Debug, Clone)]

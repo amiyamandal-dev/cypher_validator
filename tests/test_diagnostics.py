@@ -377,3 +377,118 @@ class TestSeverity:
         """Queries with only warnings should still be is_valid=True."""
         r = validator.validate("MATCH (a:Person), (b:Movie) RETURN a, b")
         assert r.is_valid  # warnings don't make it invalid
+
+
+# ---------------------------------------------------------------------------
+# Function registry validation
+# ---------------------------------------------------------------------------
+
+
+class TestFunctionRegistry:
+    def test_valid_known_function(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN toLower(n.name)")
+        codes = [d.code for d in r.diagnostics]
+        assert "E603" not in codes
+        assert "W103" not in codes
+
+    def test_wrong_arity_too_few(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN replace(n.name, 'a')")
+        codes = [d.code for d in r.diagnostics]
+        assert "E603" in codes
+        assert not r.is_valid
+
+    def test_wrong_arity_too_many(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN abs(1, 2)")
+        codes = [d.code for d in r.diagnostics]
+        assert "E603" in codes
+
+    def test_zero_arg_function_valid(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN rand()")
+        codes = [d.code for d in r.diagnostics]
+        assert "E603" not in codes
+
+    def test_zero_arg_function_too_many(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN rand(1)")
+        codes = [d.code for d in r.diagnostics]
+        assert "E603" in codes
+
+    def test_variadic_function(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN coalesce(n.name, n.age, 'x')")
+        codes = [d.code for d in r.diagnostics]
+        assert "E603" not in codes
+
+    def test_unknown_function_warning(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN myCustomFunc(n)")
+        codes = [d.code for d in r.diagnostics]
+        assert "W103" in codes
+        assert r.is_valid  # warnings don't block validity
+
+    def test_distinct_on_non_aggregate(self, validator):
+        # Note: pest grammar uses an anonymous ^"DISTINCT" literal inside
+        # function_invocation, so the builder never sees it as a child pair.
+        # DISTINCT on a scalar function is semantically meaningless in Cypher
+        # (Neo4j itself silently ignores it), so the absence of W104 is acceptable.
+        r = validator.validate("MATCH (n:Person) RETURN toLower(DISTINCT n.name)")
+        codes = [d.code for d in r.diagnostics]
+        # W104 does NOT fire because the parser can't detect the DISTINCT flag
+        assert "W104" not in codes
+
+    def test_distinct_on_aggregate_no_warning(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN count(DISTINCT n.name)")
+        codes = [d.code for d in r.diagnostics]
+        assert "W104" not in codes
+
+    def test_case_insensitive(self, validator):
+        r = validator.validate("MATCH (n:Person) RETURN TOLOWER(n.name)")
+        codes = [d.code for d in r.diagnostics]
+        assert "W103" not in codes
+        assert "E603" not in codes
+
+    def test_e601_still_fires(self, validator):
+        """Regression: numeric aggregate string-arg check still works."""
+        r = validator.validate("MATCH (n:Person) RETURN sum('hello')")
+        codes = [d.code for d in r.diagnostics]
+        assert "E601" in codes
+
+
+# ---------------------------------------------------------------------------
+# EXISTS subquery validation
+# ---------------------------------------------------------------------------
+
+
+class TestExistsSubquery:
+    def test_valid_exists_pattern(self, validator):
+        r = validator.validate(
+            "MATCH (p:Person) WHERE EXISTS { (p)-[:ACTED_IN]->(:Movie) } RETURN p"
+        )
+        # Only check for no E-codes (warnings like W-codes are fine)
+        error_codes = [d.code for d in r.diagnostics if d.code.startswith("E")]
+        assert error_codes == []
+
+    def test_unknown_label_in_exists(self, validator):
+        r = validator.validate(
+            "MATCH (p:Person) WHERE EXISTS { (p)-[:ACTED_IN]->(:Moovie) } RETURN p"
+        )
+        codes = [d.code for d in r.diagnostics]
+        assert "E201" in codes
+
+    def test_unknown_rel_in_exists(self, validator):
+        r = validator.validate(
+            "MATCH (p:Person) WHERE EXISTS { (p)-[:ACTED_INN]->(:Movie) } RETURN p"
+        )
+        codes = [d.code for d in r.diagnostics]
+        assert "E211" in codes
+
+    def test_bindings_dont_leak(self, validator):
+        r = validator.validate(
+            "MATCH (p:Person) WHERE EXISTS { (p)-[:ACTED_IN]->(m:Movie) } RETURN m"
+        )
+        codes = [d.code for d in r.diagnostics]
+        assert "E501" in codes
+
+    def test_outer_scope_visible(self, validator):
+        r = validator.validate(
+            "MATCH (p:Person) WHERE EXISTS { (p)-[:ACTED_IN]->(:Movie) } RETURN p"
+        )
+        codes = [d.code for d in r.diagnostics]
+        assert "E501" not in codes

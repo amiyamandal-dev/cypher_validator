@@ -55,8 +55,13 @@ pub enum ErrorCode {
     E613PaginationTypeNull,
     E614PaginationTypeFloat,
 
+    // Function validation
+    E603WrongArity,
+
     // Warnings
     W101CartesianProduct,
+    W103UnknownFunction,
+    W104DistinctOnNonAggregate,
     W201UnlabeledFullScan,
     W202UnboundedVarLength,
 }
@@ -83,7 +88,10 @@ impl ErrorCode {
             Self::E612PaginationTypeBool => "E612",
             Self::E613PaginationTypeNull => "E613",
             Self::E614PaginationTypeFloat => "E614",
+            Self::E603WrongArity => "E603",
             Self::W101CartesianProduct => "W101",
+            Self::W103UnknownFunction => "W103",
+            Self::W104DistinctOnNonAggregate => "W104",
             Self::W201UnlabeledFullScan => "W201",
             Self::W202UnboundedVarLength => "W202",
         }
@@ -110,7 +118,10 @@ impl ErrorCode {
             Self::E612PaginationTypeBool => "PaginationTypeBool",
             Self::E613PaginationTypeNull => "PaginationTypeNull",
             Self::E614PaginationTypeFloat => "PaginationTypeFloat",
+            Self::E603WrongArity => "WrongArity",
             Self::W101CartesianProduct => "CartesianProduct",
+            Self::W103UnknownFunction => "UnknownFunction",
+            Self::W104DistinctOnNonAggregate => "DistinctOnNonAggregate",
             Self::W201UnlabeledFullScan => "UnlabeledFullScan",
             Self::W202UnboundedVarLength => "UnboundedVarLength",
         }
@@ -119,6 +130,8 @@ impl ErrorCode {
     pub fn severity(&self) -> Severity {
         match self {
             Self::W101CartesianProduct
+            | Self::W103UnknownFunction
+            | Self::W104DistinctOnNonAggregate
             | Self::W201UnlabeledFullScan
             | Self::W202UnboundedVarLength => Severity::Warning,
             _ => Severity::Error,

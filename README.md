@@ -14,6 +14,7 @@ The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.r
 * [Core API](#core-api): Schema, CypherValidator, ValidationResult, CypherGenerator, parse_query / QueryInfo
 * [GLiNER2 integration](#gliner2-integration): NLToCypher, DB-aware query generation, EntityNERExtractor, GLiNER2RelationExtractor, RelationToCypherConverter, Neo4jDatabase
 * [LLM integration](#llm-integration): Schema prompt helpers, extract_cypher_from_text, repair_cypher, format_records, few_shot_examples, cypher_tool_spec, GraphRAGPipeline
+* [LLM NL-to-Cypher pipeline](#llm-nl-to-cypher-pipeline): LLMNLToCypher, ingest_texts, ingest_document, ChunkResult, IngestionResult
 * [What the validator checks](#what-the-validator-checks)
 * [Generated query types](#generated-query-types)
 * [Performance](#performance)
@@ -46,6 +47,8 @@ The core parser and validator are written in **Rust** (via [pyo3](https://pyo3.r
 | **Few-shot examples** | `few_shot_examples()` auto-generates (description, Cypher) pairs for LLM prompting |
 | **Tool spec builder** | `cypher_tool_spec()` produces Anthropic / OpenAI function-calling schemas for Cypher execution |
 | **Graph RAG pipeline** | `GraphRAGPipeline` chains schema injection → Cypher generation → validation → execution → answer |
+| **LLM NL-to-Cypher** | `LLMNLToCypher` generates Cypher from text via any OpenAI-compatible, Anthropic, or LangChain LLM with schema inference, validation, and repair |
+| **Batch text ingestion** | `ingest_texts()` / `ingest_document()` — two-phase batch ingestion with auto-schema stabilization, MERGE-based deduplication, and provenance tracking |
 | **Schema introspection** | `Neo4jDatabase.introspect_schema()` discovers the live DB schema automatically |
 | **Type stubs** | Full `.pyi` stub files for IDE autocompletion and mypy / pyright type checking |
 
@@ -1471,6 +1474,181 @@ pipeline = GraphRAGPipeline(schema=schema, db=db, llm_fn=call_llm)
 
 ---
 
+## LLM NL-to-Cypher pipeline
+
+`LLMNLToCypher` sends natural language text directly to an LLM to produce Cypher. It supports any OpenAI-compatible API, Anthropic, or LangChain chat model. Schema can be provided explicitly, auto-discovered from a live Neo4j database, or inferred by the LLM from the input text.
+
+### Single-text usage
+
+```python
+from cypher_validator import LLMNLToCypher, Schema
+
+schema = Schema(
+    nodes={"Person": ["name", "age"], "Company": ["name"]},
+    relationships={"WORKS_FOR": ("Person", "Company", [])},
+)
+
+# Option 1: OpenAI-compatible provider
+pipeline = LLMNLToCypher(model="gpt-4o", api_key="sk-...", schema=schema)
+
+# Option 2: Anthropic
+pipeline = LLMNLToCypher.from_anthropic(schema=schema)
+
+# Option 3: From environment variables (auto-detects provider)
+pipeline = LLMNLToCypher.from_env(schema=schema)
+
+# Generate Cypher
+cypher = pipeline("John works for Apple and lives in SF.", mode="create")
+
+# Full context with all intermediate artefacts
+ctx = pipeline.ingest_with_context("John works for Apple.", mode="merge")
+print(ctx["cypher"])              # Generated Cypher
+print(ctx["is_valid"])            # Whether it passed validation
+print(ctx["validation_errors"])   # List of error strings
+print(ctx["repair_attempts"])     # Number of LLM repair iterations
+```
+
+### Batch text ingestion — `ingest_texts()`
+
+Two-phase batch ingestion for building knowledge graphs from multiple texts:
+
+**Phase 1 — Schema stabilization** (only when no schema is available): samples a few texts to let the LLM infer the schema, accumulating it via `Schema.merge()`.
+
+**Phase 2 — Ingestion with stable schema**: processes remaining texts using a MERGE-only prompt, validates + repairs each query, and optionally generates provenance Cypher and executes against Neo4j.
+
+```python
+from cypher_validator import LLMNLToCypher, Schema
+
+schema = Schema(
+    nodes={"Person": ["name"], "Company": ["name"], "City": ["name"]},
+    relationships={
+        "WORKS_FOR": ("Person", "Company", []),
+        "LIVES_IN": ("Person", "City", []),
+    },
+)
+
+pipeline = LLMNLToCypher.from_env(schema=schema)
+
+texts = [
+    "Alice works for Acme Corp in New York.",
+    "Bob is employed at Globex and lives in Chicago.",
+    "Carol joined Initech in San Francisco.",
+]
+
+result = pipeline.ingest_texts(
+    texts,
+    source_ids=["doc1", "doc2", "doc3"],  # optional per-text identifiers
+    provenance=True,                       # generate Chunk/MENTIONED_IN Cypher
+    progress_fn=lambda cur, tot: print(f"{cur}/{tot}"),
+)
+
+print(result.total)               # 3
+print(result.succeeded)           # number that passed validation
+print(result.failed)              # number that failed
+print(result.schema_source)       # "user", "db", or "inferred"
+print(result.schema_sample_texts) # 0 when schema was provided
+
+for chunk in result.results:
+    print(f"[{chunk.index}] valid={chunk.is_valid} repairs={chunk.repair_attempts}")
+    print(f"  Cypher: {chunk.cypher[:80]}...")
+    if chunk.provenance_cypher:
+        print(f"  Provenance: {chunk.provenance_cypher[:60]}...")
+```
+
+**With execution against Neo4j:**
+
+```python
+from cypher_validator import LLMNLToCypher, Neo4jDatabase
+
+db = Neo4jDatabase("bolt://localhost:7687", "neo4j", "password")
+
+pipeline = LLMNLToCypher.from_env(schema=schema, db=db)
+
+result = pipeline.ingest_texts(
+    texts,
+    execute=True,      # run domain + provenance Cypher against Neo4j
+    on_error="skip",   # "skip" (default) or "raise"
+)
+
+for chunk in result.results:
+    print(f"[{chunk.index}] executed={chunk.executed} error={chunk.execution_error}")
+```
+
+**Without a schema (auto-inference):**
+
+```python
+pipeline = LLMNLToCypher.from_env()  # no schema, no db
+
+result = pipeline.ingest_texts(
+    texts,
+    schema_sample_size=2,  # use first 2 texts to infer schema
+)
+
+# The LLM inferred the schema from the sample texts
+print(result.schema)               # Schema(...)
+print(result.schema_source)        # "inferred"
+print(result.schema_sample_texts)  # 2
+```
+
+### Document ingestion — `ingest_document()`
+
+Convenience wrapper that chunks a long document and delegates to `ingest_texts()`. Splits on sentence boundaries with configurable chunk size and overlap.
+
+```python
+long_text = open("article.txt").read()
+
+result = pipeline.ingest_document(
+    long_text,
+    source_id="article",         # chunks get IDs: article_chunk_0, article_chunk_1, ...
+    chunk_size=2000,             # max characters per chunk
+    chunk_overlap=200,           # overlap between consecutive chunks
+    provenance=True,
+)
+
+print(f"Chunked into {result.total} pieces, {result.succeeded} succeeded")
+```
+
+### `ChunkResult` and `IngestionResult`
+
+| `ChunkResult` field | Type | Description |
+| --- | --- | --- |
+| `index` | `int` | Position in the input list |
+| `source_id` | `str` | Identifier for this text |
+| `text_preview` | `str` | First 80 characters of the input text |
+| `cypher` | `str` | Generated domain Cypher (MERGE-based) |
+| `provenance_cypher` | `str` | Deterministic `Chunk` / `MENTIONED_IN` Cypher |
+| `is_valid` | `bool` | Whether the Cypher passed validation |
+| `validation_errors` | `list[str]` | Validation error messages |
+| `repair_attempts` | `int` | Number of LLM repair iterations |
+| `executed` | `bool` | Whether the Cypher was executed against the DB |
+| `execution_error` | `str \| None` | Error message if execution failed |
+| `records` | `list[dict]` | Records returned by Neo4j |
+
+| `IngestionResult` field | Type | Description |
+| --- | --- | --- |
+| `schema` | `Schema` | Final stabilized schema |
+| `schema_source` | `str` | `"user"`, `"db"`, or `"inferred"` |
+| `results` | `list[ChunkResult]` | Per-text results |
+| `total` | `int` | Number of texts processed |
+| `succeeded` | `int` | Number that passed validation |
+| `failed` | `int` | Number that failed validation |
+| `schema_sample_texts` | `int` | Number of texts used for schema inference |
+| `errors` | `list[tuple[int, str]]` | `(index, error_message)` for failed texts |
+
+### `ingest_texts()` parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `texts` | required | List of natural language passages |
+| `source_ids` | auto | Per-text identifiers (defaults to `text_0`, `text_1`, ...) |
+| `execute` | `False` | Execute Cypher against `self.db` |
+| `schema_sample_size` | `3` | Texts to sample for schema inference (Phase 1) |
+| `provenance` | `True` | Generate `Chunk` / `MENTIONED_IN` provenance Cypher |
+| `on_error` | `"skip"` | `"skip"` or `"raise"` |
+| `progress_fn` | `None` | Callback `(current, total)` after each text |
+
+---
+
 ## What the validator checks
 
 The semantic validator performs the following checks **against the provided schema**:
@@ -1672,6 +1850,8 @@ cypher_validator/
 │       │                             #   Neo4jDatabase (incl. introspect_schema)
 │       ├── llm_utils.py              # extract_cypher_from_text, format_records,
 │       │                             #   repair_cypher, cypher_tool_spec, few_shot_examples
+│       ├── llm_pipeline.py           # LLMNLToCypher, ChunkResult, IngestionResult,
+│       │                             #   ingest_texts, ingest_document
 │       └── rag.py                    # GraphRAGPipeline
 │
 └── tests/                            # 395 tests total
@@ -1689,7 +1869,8 @@ cypher_validator/
     ├── test_task3_features.py        # "Did you mean", new generator types, deduplication
     ├── test_llm_utils.py             # extract_cypher_from_text, format_records, repair_cypher,
     │                                 #   cypher_tool_spec, few_shot_examples, Schema prompt methods
-    └── test_rag.py                   # GraphRAGPipeline — construction, query, repair loop, error handling
+    ├── test_rag.py                   # GraphRAGPipeline — construction, query, repair loop, error handling
+    └── test_ingest.py                # ingest_texts, ingest_document, _chunk_text, _build_provenance_cypher
 
 ```
 

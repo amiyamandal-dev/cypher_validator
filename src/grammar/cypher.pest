@@ -26,7 +26,9 @@ multi_part_query = {
 }
 
 // ===== Clauses =====
-reading_clause = { match_clause | unwind_clause | in_query_call }
+reading_clause = { match_clause | unwind_clause | call_subquery | in_query_call }
+
+call_subquery = { ^"CALL" ~ "{" ~ regular_query ~ "}" }
 
 match_clause = {
     ^"OPTIONAL"? ~ ^"MATCH" ~ pattern ~ where_clause?
@@ -198,9 +200,12 @@ atom = {
   | literal
   | parameter
   | case_expression
+  | pattern_comprehension
   | list_comprehension
   | quantifier_expression
   | exists_subquery
+  | count_subquery
+  | collect_subquery
   | count_star
   | function_invocation
   | variable
@@ -257,6 +262,13 @@ quantifier_expression = {
 exists_subquery = {
     ^"EXISTS" ~ "{" ~ pattern ~ "}"
 }
+
+pattern_comprehension = {
+    "[" ~ pattern_element ~ (^"WHERE" ~ expression)? ~ "|" ~ expression ~ "]"
+}
+
+count_subquery = { ^"COUNT" ~ "{" ~ regular_query ~ "}" }
+collect_subquery = { ^"COLLECT" ~ "{" ~ regular_query ~ "}" }
 
 // ===== Literals =====
 literal = {
